@@ -1,13 +1,14 @@
-use std::cell::{RefCell, Cell};
-use std::rc::Rc;
+use crate::{ops, tape::Tape};
 use smallvec::SmallVec;
-use crate::{tape::Tape, ops};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 #[derive(Clone)]
 pub struct Tensor {
     data: Rc<RefCell<Vec<f32>>>,
     pub(crate) shape: SmallVec<[usize; 4]>,
-    pub grad: Rc<RefCell<Option<Rc<Tensor>>>>,  // Changed to Rc<RefCell<...>>
+    // In-place gradient accumulation buffer (allocated on demand)
+    pub grad: Rc<RefCell<Option<Vec<f32>>>>,
     pub requires_grad: bool,
     pub tape_node: Cell<Option<usize>>,
 }
@@ -51,18 +52,33 @@ impl Tensor {
         self.data.borrow()
     }
 
+    /// Zero-copy view of gradient buffer, if present.
+    pub fn grad_ref(&self) -> Option<std::cell::Ref<'_, Vec<f32>>> {
+        let r = self.grad.borrow();
+        if r.is_some() {
+            Some(std::cell::Ref::map(r, |opt| opt.as_ref().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// Compatibility accessor: materializes a Tensor from the grad buffer (allocates).
+    /// Keep for old debug/prints; prefer `grad_ref()` for zero-copy.
     pub fn grad(&self) -> Option<Rc<Tensor>> {
-        self.grad.borrow().clone()
+        let r = self.grad.borrow();
+        r.as_ref().map(|g| {
+            let mut t = Tensor::new(g.clone(), &self.shape);
+            t.requires_grad = false;
+            Rc::new(t)
+        })
     }
 
     pub fn backward(&self) {
-        // Initialize gradient to 1.0 for the output
+        // Seed ∂L/∂self = 1
         let ones = vec![1.0; self.data().len()];
-        let mut init_grad = Tensor::new(ones, &self.shape);
-        init_grad.requires_grad = false;  // IMPORTANT: Gradients never require grad
-        *self.grad.borrow_mut() = Some(Rc::new(init_grad));
+        *self.grad.borrow_mut() = Some(ones);
 
-        // Perform backward pass
+        // Walk the tape from the node that produced this tensor.
         if let Some(node_id) = self.tape_node.get() {
             crate::tape::backward(node_id);
         }
@@ -94,6 +110,7 @@ impl Tensor {
         let cols = self.shape[1];
         let data = self.data();
 
+        // Forward
         let mut result = vec![0.0; data.len()];
         for i in 0..rows {
             for j in 0..cols {
@@ -108,12 +125,22 @@ impl Tensor {
 
             let input = self.clone();
             let out = output.clone();
+            let (rows, cols) = (rows, cols); // capture for closure
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(grad_output) = out.grad.borrow().as_ref() {
-                    // Gradient of transpose is just transpose
-                    let grad_t = grad_output.transpose();
-                    ops::accumulate_grad(&input, &grad_t);
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    // grad_input = transpose(grad_output)
+                    let mut slot = input.grad.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(vec![0.0; rows * cols]);
+                    }
+                    let gin = slot.as_mut().unwrap();
+                    // gout shape: [cols, rows], gin shape: [rows, cols]
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            gin[i * cols + j] += gout[j * rows + i];
+                        }
+                    }
                 }
             });
         }
@@ -123,12 +150,13 @@ impl Tensor {
 
     /// Sigmoid activation
     pub fn sigmoid(&self) -> Tensor {
-        let result_data: Vec<f32> = self.data()
+        // Forward: y = σ(x)
+        let result_data: Vec<f32> = self
+            .data()
             .iter()
             .map(|&x| 1.0 / (1.0 + (-x).exp()))
             .collect();
 
-        let sigmoid_data = result_data.clone();
         let mut output = Tensor::new(result_data, &self.shape);
 
         if self.requires_grad {
@@ -138,17 +166,16 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(grad_output) = out.grad.borrow().as_ref() {
-                    // d(sigmoid)/dx = sigmoid * (1 - sigmoid)
-                    let grad_data: Vec<f32> = grad_output.data()
-                        .iter()
-                        .zip(sigmoid_data.iter())
-                        .map(|(g, s)| g * s * (1.0 - s))
-                        .collect();
-
-                    let mut grad_tensor = Tensor::new(grad_data, &input.shape);
-                    grad_tensor.requires_grad = false;
-                    ops::accumulate_grad(&input, &grad_tensor);
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    let y = out.data(); // σ(x) from forward
+                    let mut slot = input.grad.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(vec![0.0; y.len()]);
+                    }
+                    let gin = slot.as_mut().unwrap();
+                    for ((gi, &g), &s) in gin.iter_mut().zip(gout.iter()).zip(y.iter()) {
+                        *gi += g * s * (1.0 - s);
+                    }
                 }
             });
         }
@@ -158,25 +185,25 @@ impl Tensor {
 
     /// Supports adding [batch, features] + [features] -> [batch, features]
     pub fn add_broadcast(&self, other: &Tensor) -> Tensor {
-        // Check if broadcasting is needed
+        // Fast path: identical shapes
         if self.shape == other.shape {
-            // Same shape, use regular addition
             return self + other;
         }
 
-        // Handle bias addition: [batch, features] + [features]
+        // Bias addition: [batch, features] + [features]
         if self.shape.len() == 2 && other.shape.len() == 1 {
-            assert_eq!(self.shape[1], other.shape[0],
-                      "Last dimension must match for broadcasting");
+            assert_eq!(
+                self.shape[1], other.shape[0],
+                "Last dimension must match for broadcasting"
+            );
 
             let batch_size = self.shape[0];
             let features = self.shape[1];
             let self_data = self.data();
             let other_data = other.data();
 
+            // Forward
             let mut result = vec![0.0; self_data.len()];
-
-            // Add bias to each batch
             for b in 0..batch_size {
                 for f in 0..features {
                     let idx = b * features + f;
@@ -192,30 +219,25 @@ impl Tensor {
                 let a = self.clone();
                 let b = other.clone();
                 let out = output.clone();
-                let batch_size = batch_size;
+                let (batch_size, features) = (batch_size, features);
 
-                Tape::push_unary_op(other, &output, move || {
-                    if let Some(grad_output) = out.grad.borrow().as_ref() {
-                        // Gradient for input: same as output
+                // Use binary op so we record when *either* input requires grad.
+                Tape::push_binary_op(self, other, &output, move || {
+                    if let Some(gout) = out.grad.borrow().as_ref() {
+                        // dL/dA = dL/dY
                         if a.requires_grad {
-                            ops::accumulate_grad(&a, grad_output);
+                            ops::accumulate_grad(&a, gout);
                         }
 
-                        // Gradient for bias: sum over batch dimension
+                        // dL/dB[f] = sum_b dL/dY[b,f]
                         if b.requires_grad {
-                            let grad_out_data = grad_output.data();
-                            let features = b.shape[0];
                             let mut bias_grad = vec![0.0; features];
-
                             for batch in 0..batch_size {
                                 for f in 0..features {
-                                    bias_grad[f] += grad_out_data[batch * features + f];
+                                    bias_grad[f] += gout[batch * features + f];
                                 }
                             }
-
-                            let mut grad_tensor = Tensor::new(bias_grad, &b.shape);
-                            grad_tensor.requires_grad = false;
-                            ops::accumulate_grad(&b, &grad_tensor);
+                            ops::accumulate_grad(&b, &bias_grad);
                         }
                     }
                 });
@@ -223,8 +245,10 @@ impl Tensor {
 
             output
         } else {
-            panic!("Unsupported broadcasting shapes: {:?} and {:?}",
-                   self.shape, other.shape);
+            panic!(
+                "Unsupported broadcasting shapes: {:?} and {:?}",
+                self.shape, other.shape
+            );
         }
     }
 
@@ -243,14 +267,11 @@ impl Tensor {
             let n = data.len() as f32;
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(grad_output) = out.grad.borrow().as_ref() {
-                    // Gradient of mean is grad_out / n for all elements
-                    let grad_val = grad_output.data()[0] / n;
-                    let grad_data = vec![grad_val; input.data().len()];
-
-                    let mut grad_tensor = Tensor::new(grad_data, &input.shape);
-                    grad_tensor.requires_grad = false;
-                    ops::accumulate_grad(&input, &grad_tensor);
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    // Each element gets gout / N
+                    let g_each = gout[0] / n;
+                    let grad_vec = vec![g_each; input.data().len()];
+                    ops::accumulate_grad(&input, &grad_vec);
                 }
             });
         }

@@ -1,17 +1,12 @@
-use taper::{Tape, Tensor};
-use taper::nn::{Linear, Module, Sequential};
 use taper::activation::Sigmoid;
-use taper::optim::{Optimizer, SGD};
 use taper::loss::bce_loss;
+use taper::nn::{Linear, Module, Sequential};
+use taper::optim::{Optimizer, SGD};
+use taper::{Tape, Tensor};
 
 fn main() {
     // XOR
-    let x_data = vec![
-        0.0, 0.0,
-        0.0, 1.0,
-        1.0, 0.0,
-        1.0, 1.0,
-    ];
+    let x_data = vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
     let y_data = vec![0.0, 1.0, 1.0, 0.0];
 
     let model = Sequential::new(vec![
@@ -27,7 +22,7 @@ fn main() {
     let epochs = 10_000usize;
 
     for epoch in 0..epochs {
-        let _tape = Tape::new();
+        Tape::reset(); // clear tape for new forward/backward pass
 
         let x = Tensor::new(x_data.clone(), &[4, 2]);
         let y = Tensor::new(y_data.clone(), &[4, 1]);

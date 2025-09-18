@@ -1,7 +1,9 @@
 use taper::{Tape, Tensor};
 
 #[inline]
-fn s(t: &Tensor) -> f32 { t.data()[0] }
+fn s(t: &Tensor) -> f32 {
+    t.data()[0]
+}
 
 macro_rules! g {
     ($t:expr) => {

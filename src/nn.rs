@@ -27,9 +27,8 @@ impl Linear {
 
         let weight = Tensor::new(weight_data, &[out_features, in_features]).requires_grad();
 
-        let bias = with_bias.then(|| {
-            Tensor::new(vec![0.0; out_features], &[out_features]).requires_grad()
-        });
+        let bias = with_bias
+            .then(|| Tensor::new(vec![0.0; out_features], &[out_features]).requires_grad());
 
         Self { weight, bias }
     }

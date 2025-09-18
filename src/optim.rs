@@ -23,7 +23,7 @@ impl Optimizer for SGD {
             if let Some(grad) = param.grad() {
                 let mut param_data = param.data_mut();
                 let grad_data = grad.data();
-                
+
                 // Vanilla SGD update: param = param - lr * grad
                 for i in 0..param_data.len() {
                     param_data[i] -= self.lr * grad_data[i];
@@ -31,7 +31,7 @@ impl Optimizer for SGD {
             }
         }
     }
-    
+
     fn zero_grad(&mut self) {
         for param in &self.params {
             param.zero_grad();

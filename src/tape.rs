@@ -23,9 +23,7 @@ struct Node {
 
 impl Tape {
     pub fn new() -> Self {
-        let inner = Rc::new(RefCell::new(TapeInner {
-            nodes: Vec::new(),
-        }));
+        let inner = Rc::new(RefCell::new(TapeInner { nodes: Vec::new() }));
 
         // Set this tape as the active one
         TAPE.with(|t| {
@@ -35,52 +33,58 @@ impl Tape {
         Tape { inner }
     }
 
-    pub fn push_binary_op<F>(
-        a: &Tensor,
-        b: &Tensor,
-        output: &Tensor,
-        backward_fn: F,
-    ) where
-        F: Fn() + 'static
+    // Ensure a tape exists for this thread.
+    pub fn ensure_active() {
+        TAPE.with(|t| {
+            if t.borrow().is_none() {
+                *t.borrow_mut() = Some(Rc::new(RefCell::new(TapeInner { nodes: Vec::new() })));
+            }
+        });
+    }
+
+    /// Clear all recorded nodes but keep the tape active.
+    pub fn reset() {
+        TAPE.with(|t| {
+            if let Some(ref inner) = *t.borrow() {
+                inner.borrow_mut().nodes.clear();
+            }
+        });
+    }
+
+    pub fn push_binary_op<F>(a: &Tensor, b: &Tensor, output: &Tensor, backward_fn: F)
+    where
+        F: Fn() + 'static,
     {
-        if !a.requires_grad && !b.requires_grad {
+        if !(a.requires_grad || b.requires_grad) {
             return;
         }
-
+        Self::ensure_active(); // <-- auto-init
         TAPE.with(|tape| {
-            if let Some(ref tape_inner) = *tape.borrow() {
-                let mut tape_inner = tape_inner.borrow_mut();
-                let node_id = tape_inner.nodes.len();
-
-                // Set the node ID on the output tensor
-                output.tape_node.set(Some(node_id));
-
-                tape_inner.nodes.push(Node {
+            if let Some(ref inner) = *tape.borrow() {
+                let mut inner = inner.borrow_mut();
+                let id = inner.nodes.len();
+                output.tape_node.set(Some(id));
+                inner.nodes.push(Node {
                     backward_fn: Box::new(backward_fn),
                 });
             }
         });
     }
 
-    pub fn push_unary_op<F>(
-        input: &Tensor,
-        output: &Tensor,
-        backward_fn: F,
-    ) where
-        F: Fn() + 'static
+    pub fn push_unary_op<F>(input: &Tensor, output: &Tensor, backward_fn: F)
+    where
+        F: Fn() + 'static,
     {
         if !input.requires_grad {
             return;
         }
-
+        Self::ensure_active(); // <-- auto-init
         TAPE.with(|tape| {
-            if let Some(ref tape_inner) = *tape.borrow() {
-                let mut tape_inner = tape_inner.borrow_mut();
-                let node_id = tape_inner.nodes.len();
-
-                output.tape_node.set(Some(node_id));
-
-                tape_inner.nodes.push(Node {
+            if let Some(ref inner) = *tape.borrow() {
+                let mut inner = inner.borrow_mut();
+                let id = inner.nodes.len();
+                output.tape_node.set(Some(id));
+                inner.nodes.push(Node {
                     backward_fn: Box::new(backward_fn),
                 });
             }
