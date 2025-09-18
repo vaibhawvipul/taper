@@ -4,6 +4,11 @@ use taper::nn::{Linear, Module, Sequential};
 use taper::optim::{Optimizer, SGD};
 use taper::{Tape, Tensor};
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
     // XOR
     let x_data = vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
@@ -19,7 +24,7 @@ fn main() {
     let params = model.parameters();
     let mut opt = SGD::new(params, 0.10, None);
 
-    let epochs = 10_000usize;
+    let epochs = 50_000usize;
 
     for epoch in 0..epochs {
         Tape::reset(); // clear tape for new forward/backward pass
@@ -34,7 +39,7 @@ fn main() {
         opt.step();
         opt.zero_grad();
 
-        if epoch % 500 == 0 {
+        if epoch % 1000 == 0 {
             println!("iteration {:4}: Loss = {:.4}", epoch, loss.data()[0]);
         }
     }
