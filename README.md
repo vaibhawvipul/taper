@@ -1,7 +1,7 @@
 # taper
 A simple neural network library in Rust.
 
-This library is an autograd engine and neural network library implemented from scratch in Rust. It supports basic tensor operations, automatic differentiation, and simple neural network layers.
+This library is an autograd engine with dynamic computational graph and neural network library implemented from scratch in Rust. It supports basic tensor operations, automatic differentiation, and simple neural network layers.
 
 We support -
 - Basic tensor operations (addition, multiplication, etc.)
