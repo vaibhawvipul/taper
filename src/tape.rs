@@ -1,8 +1,10 @@
-use crate::tensor::Tensor;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::tensor::Tensor;
+
 thread_local! {
+    // Thread-local active tape; allocated on demand.
     static TAPE: RefCell<Option<Rc<RefCell<TapeInner>>>> = RefCell::new(None);
 }
 
@@ -12,28 +14,23 @@ pub struct Tape {
 }
 
 struct TapeInner {
+    // Store closures as Rc so we can clone them out of the borrow and run safely.
     nodes: Vec<Node>,
 }
 
-type BackwardFn = Box<dyn Fn()>;
-
 struct Node {
-    backward_fn: BackwardFn,
+    backward_fn: Rc<dyn Fn()>,
 }
 
 impl Tape {
+    /// Ensure a tape exists for this thread and return a handle.
     pub fn new() -> Self {
-        let inner = Rc::new(RefCell::new(TapeInner { nodes: Vec::new() }));
-
-        // Set this tape as the active one
-        TAPE.with(|t| {
-            *t.borrow_mut() = Some(inner.clone());
-        });
-
+        Self::ensure_active();
+        let inner = TAPE.with(|t| t.borrow().as_ref().cloned().expect("tape missing"));
         Tape { inner }
     }
 
-    // Ensure a tape exists for this thread.
+    /// Make sure the thread-local tape is initialized.
     pub fn ensure_active() {
         TAPE.with(|t| {
             if t.borrow().is_none() {
@@ -42,11 +39,11 @@ impl Tape {
         });
     }
 
-    /// Clear all recorded nodes but keep the tape active.
+    /// Clear recorded nodes but keep the tape alive.
     pub fn reset() {
         TAPE.with(|t| {
-            if let Some(ref inner) = *t.borrow() {
-                inner.borrow_mut().nodes.clear();
+            if let Some(rc) = t.borrow().as_ref().cloned() {
+                rc.borrow_mut().nodes.clear();
             }
         });
     }
@@ -58,17 +55,22 @@ impl Tape {
         if !(a.requires_grad || b.requires_grad) {
             return;
         }
-        Self::ensure_active(); // <-- auto-init
-        TAPE.with(|tape| {
-            if let Some(ref inner) = *tape.borrow() {
-                let mut inner = inner.borrow_mut();
+        Self::ensure_active();
+
+        // Take Rc out while the RefCell borrow is active, then drop it before mut borrow.
+        let rc_opt = TAPE.with(|tape| tape.borrow().as_ref().cloned());
+        if let Some(rc) = rc_opt {
+            let id = {
+                let mut inner = rc.borrow_mut();
                 let id = inner.nodes.len();
-                output.tape_node.set(Some(id));
                 inner.nodes.push(Node {
-                    backward_fn: Box::new(backward_fn),
+                    backward_fn: Rc::new(backward_fn),
                 });
-            }
-        });
+                id
+            };
+            // stamp after releasing inner borrow
+            output.tape_node.set(Some(id));
+        }
     }
 
     pub fn push_unary_op<F>(input: &Tensor, output: &Tensor, backward_fn: F)
@@ -78,40 +80,50 @@ impl Tape {
         if !input.requires_grad {
             return;
         }
-        Self::ensure_active(); // <-- auto-init
-        TAPE.with(|tape| {
-            if let Some(ref inner) = *tape.borrow() {
-                let mut inner = inner.borrow_mut();
+        Self::ensure_active();
+
+        let rc_opt = TAPE.with(|tape| tape.borrow().as_ref().cloned());
+        if let Some(rc) = rc_opt {
+            let id = {
+                let mut inner = rc.borrow_mut();
                 let id = inner.nodes.len();
-                output.tape_node.set(Some(id));
                 inner.nodes.push(Node {
-                    backward_fn: Box::new(backward_fn),
+                    backward_fn: Rc::new(backward_fn),
                 });
-            }
-        });
+                id
+            };
+            output.tape_node.set(Some(id));
+        }
     }
 }
 
+/// Execute backward functions up to `final_node_id` (inclusive), in reverse.
+/// We clone closures out first to avoid holding any RefCell borrows while executing.
 pub fn backward(final_node_id: usize) {
-    TAPE.with(|tape| {
-        if let Some(ref tape_inner) = *tape.borrow() {
-            let tape_inner = tape_inner.borrow();
-
-            // Execute backward functions in reverse order
-            for i in (0..=final_node_id).rev() {
-                if i < tape_inner.nodes.len() {
-                    (tape_inner.nodes[i].backward_fn)();
-                }
-            }
+    // Clone the closures we’ll run (no borrows alive afterwards).
+    let fns: Vec<Rc<dyn Fn()>> = TAPE.with(|t| {
+        let Some(rc) = t.borrow().as_ref().cloned() else {
+            return Vec::new();
+        };
+        let inner = rc.borrow();
+        if inner.nodes.is_empty() {
+            return Vec::new();
         }
+        let end = final_node_id.min(inner.nodes.len().saturating_sub(1));
+        inner.nodes[..=end]
+            .iter()
+            .map(|n| n.backward_fn.clone())
+            .collect()
     });
+
+    // Run in reverse with no outstanding borrows.
+    for f in fns.into_iter().rev() {
+        (f)();
+    }
 }
 
 impl Drop for Tape {
     fn drop(&mut self) {
-        // Clear the thread-local tape when this Tape is dropped
-        TAPE.with(|t| {
-            *t.borrow_mut() = None;
-        });
+        // Keep the tape alive; prefer explicit Tape::reset() per batch.
     }
 }

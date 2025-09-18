@@ -45,7 +45,7 @@ fn main() {
     }
 
     // final eval
-    let _tape = Tape::new();
+    let _tape = Tape::reset();
     let x = Tensor::new(x_data, &[4, 2]);
     let yhat = model.forward(&x);
     let p = yhat.data();

@@ -19,3 +19,9 @@ This is currently a work-in-progress and is not optimized for performance. SIMD 
 ```sh
 cargo run
 ```
+
+With full BLAS acceleration -
+
+```sh
+cargo run --release --features blas-accelerate --example train_mnist
+```

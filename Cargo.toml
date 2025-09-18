@@ -3,13 +3,28 @@ name = "taper"
 version = "0.1.0"
 edition = "2024"
 authors = ["Vipul Vaibhaw <vaibhaw.vipul@gmail.com>"]
+build = "build.rs"
 
 [dependencies]
-num-traits = "0.2.19"
 smallvec = "1.15.1"
 rand = "0.8.5"
 rand_distr = "0.4.3"
 mimalloc = { version = "0.1.48", default-features = false }
+flate2 = "1.1.2"
+reqwest = { version = "0.12.23", features = ["blocking", "json"] }
+indicatif = "0.17"
+matrixmultiply = "0.3"
+cblas-sys = { version = "0.1", optional = true }
+blas-src   = { version = "0.10", default-features = false, optional = true } # vendor chosen by features below
+
+[features]
+# Default: pure-Rust GEMM (matrixmultiply)
+default = []
+
+# Enable BLAS via CBLAS API and select a vendor:
+blas = ["cblas-sys", "blas-src"]                # turn on CBLAS
+blas-openblas = ["blas", "blas-src/openblas"]   # build & link OpenBLAS
+blas-accelerate = ["blas", "blas-src/accelerate"] # macOS Accelerate
 
 [dev-dependencies]
 criterion = "0.5"

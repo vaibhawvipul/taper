@@ -1,5 +1,6 @@
+use crate::gemm::{n as no_trans, sgemm_rowmajor, t as trans};
 use crate::{Tensor, tape::Tape};
-use std::ops::{Add, Mul, Sub};
+use std::ops::{Add, Div, Mul, Sub};
 
 // Import the SIMD utilities from tensor module
 use crate::tensor::simd;
@@ -190,115 +191,106 @@ impl Mul for Tensor {
 
 impl Tensor {
     /// SIMD-optimized matrix multiplication
+    /// Fast matrix multiplication: [m,k] @ [k,n] -> [m,n]
+    /// Fast matrix multiplication: [m,k] @ [k,n_out] -> [m,n_out]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         assert_eq!(self.shape.len(), 2, "First tensor must be 2D");
         assert_eq!(other.shape.len(), 2, "Second tensor must be 2D");
 
-        let m = self.shape[0];
-        let k = self.shape[1];
-        let n = other.shape[1];
+        let m = self.shape[0] as i32;
+        let k = self.shape[1] as i32;
+        let k2 = other.shape[0] as i32;
+        let n_out = other.shape[1] as i32;
+        assert_eq!(k, k2, "Inner dimensions must match: {} vs {}", k, k2);
 
-        assert_eq!(
-            k, other.shape[0],
-            "Inner dimensions must match: {}x{} @ {}x{}",
-            m, k, other.shape[0], n
+        let a = self.data();
+        let b = other.data();
+        let mut c = vec![0.0f32; (m * n_out) as usize];
+
+        // Forward: C = A * B
+        sgemm_rowmajor(
+            no_trans(),
+            no_trans(),
+            m,
+            n_out,
+            k,
+            1.0,
+            &a[..],
+            &b[..],
+            0.0,
+            &mut c,
         );
 
-        let mut result = vec![0.0f32; m * n];
-        let a_data = self.data();
-        let b_data = other.data();
+        let mut out = Tensor::new(c, &[m as usize, n_out as usize]);
 
-        // Optimized matmul with better cache locality
-        // Using tiling for cache efficiency
-        let tile_size = 64.min(m).min(n).min(k);
-
-        for i0 in (0..m).step_by(tile_size) {
-            for j0 in (0..n).step_by(tile_size) {
-                for k0 in (0..k).step_by(tile_size) {
-                    // Process tile
-                    let i_max = (i0 + tile_size).min(m);
-                    let j_max = (j0 + tile_size).min(n);
-                    let k_max = (k0 + tile_size).min(k);
-
-                    for i in i0..i_max {
-                        for j in j0..j_max {
-                            let mut sum = result[i * n + j];
-
-                            // Inner loop - potential for SIMD
-                            for k_idx in k0..k_max {
-                                sum += a_data[i * k + k_idx] * b_data[k_idx * n + j];
-                            }
-
-                            result[i * n + j] = sum;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut output = Tensor::new(result, &[m, n]);
-
-        // Backward pass setup
         if self.requires_grad || other.requires_grad {
-            output.requires_grad = true;
-
-            let a = self.clone();
-            let b = other.clone();
-            let out = output.clone();
-
+            out.requires_grad = true;
+            let a_t = self.clone();
+            let b_t = other.clone();
+            let out_t = out.clone();
             let a_shape = self.shape.clone();
             let b_shape = other.shape.clone();
 
-            Tape::push_binary_op(self, other, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
-                    if a.requires_grad {
-                        // Gradient w.r.t A: dL/dA = dL/dC @ B^T
-                        let (m, k) = (a_shape[0], a_shape[1]);
-                        let n = b_shape[1];
-                        let bdat = b.data();
-                        let mut slot = a.grad.borrow_mut();
+            Tape::push_binary_op(self, other, &out, move || {
+                if let Some(gout_vec) = out_t.grad.borrow().as_ref() {
+                    let gout = &gout_vec[..];
+
+                    // dA += dC * B^T   (m×k) = (m×n_out) * (n_out×k)
+                    if a_t.requires_grad {
+                        let m = a_shape[0] as i32;
+                        let k = a_shape[1] as i32;
+                        let n_out = b_shape[1] as i32;
+
+                        let bdat = b_t.data();
+                        let mut slot = a_t.grad.borrow_mut();
                         if slot.is_none() {
-                            *slot = Some(vec![0.0; m * k]);
+                            *slot = Some(vec![0.0; (m * k) as usize]);
                         }
                         let ga = slot.as_mut().unwrap();
-
-                        // Tiled gradient computation
-                        for i in 0..m {
-                            for j in 0..k {
-                                let mut acc = 0.0;
-                                for t in 0..n {
-                                    acc += gout[i * n + t] * bdat[j * n + t];
-                                }
-                                ga[i * k + j] += acc;
-                            }
-                        }
+                        sgemm_rowmajor(
+                            no_trans(),
+                            trans(),
+                            m,
+                            k,
+                            n_out,
+                            1.0,
+                            gout,
+                            &bdat[..],
+                            1.0,
+                            ga,
+                        );
                     }
-                    if b.requires_grad {
-                        // Gradient w.r.t B: dL/dB = A^T @ dL/dC
-                        let (k, n) = (b_shape[0], b_shape[1]);
-                        let m = a_shape[0];
-                        let adat = a.data();
-                        let mut slot = b.grad.borrow_mut();
+
+                    // dB += A^T * dC   (k×n_out) = (k×m) * (m×n_out)
+                    if b_t.requires_grad {
+                        let kdim = b_shape[0] as i32;
+                        let n_out = b_shape[1] as i32;
+                        let m = a_shape[0] as i32;
+
+                        let adat = a_t.data();
+                        let mut slot = b_t.grad.borrow_mut();
                         if slot.is_none() {
-                            *slot = Some(vec![0.0; k * n]);
+                            *slot = Some(vec![0.0; (kdim * n_out) as usize]);
                         }
                         let gb = slot.as_mut().unwrap();
-
-                        for i in 0..k {
-                            for j in 0..n {
-                                let mut acc = 0.0;
-                                for t in 0..m {
-                                    acc += adat[t * a_shape[1] + i] * gout[t * n + j];
-                                }
-                                gb[i * n + j] += acc;
-                            }
-                        }
+                        sgemm_rowmajor(
+                            trans(),
+                            no_trans(),
+                            kdim,
+                            n_out,
+                            m,
+                            1.0,
+                            &adat[..],
+                            gout,
+                            1.0,
+                            gb,
+                        );
                     }
                 }
             });
         }
 
-        output
+        out
     }
 
     /// Create a random tensor with values from normal distribution
@@ -438,5 +430,85 @@ impl Sub for Tensor {
     type Output = Tensor;
     fn sub(self, other: Tensor) -> Tensor {
         (&self).sub(&other)
+    }
+}
+
+impl Div for &Tensor {
+    type Output = Tensor;
+    fn div(self, other: &Tensor) -> Tensor {
+        assert_eq!(
+            self.data().len(),
+            other.data().len(),
+            "Tensor dimensions must match"
+        );
+
+        let self_data = self.data();
+        let other_data = other.data();
+        let mut out_data = vec![0.0; self_data.len()];
+
+        // Element-wise division
+        for i in 0..out_data.len() {
+            out_data[i] = self_data[i] / other_data[i];
+        }
+
+        let mut out = Tensor::new(out_data, &self.shape);
+
+        if self.requires_grad || other.requires_grad {
+            out.requires_grad = true;
+            let a = self.clone();
+            let b = other.clone();
+            let o = out.clone();
+
+            Tape::push_binary_op(self, other, &out, move || {
+                if let Some(gout) = o.grad.borrow().as_ref() {
+                    if a.requires_grad {
+                        let bdat = b.data();
+                        let mut slot = a.grad.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(vec![0.0; bdat.len()]);
+                        }
+                        let ga = slot.as_mut().unwrap();
+                        for i in 0..ga.len() {
+                            ga[i] += gout[i] / bdat[i];
+                        }
+                    }
+                    if b.requires_grad {
+                        let adat = a.data();
+                        let bdat = b.data();
+                        let mut slot = b.grad.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(vec![0.0; adat.len()]);
+                        }
+                        let gb = slot.as_mut().unwrap();
+                        for i in 0..gb.len() {
+                            gb[i] -= gout[i] * adat[i] / (bdat[i] * bdat[i]);
+                        }
+                    }
+                }
+            });
+        }
+        out
+    }
+}
+
+// Implement other combinations
+impl Div<&Tensor> for Tensor {
+    type Output = Tensor;
+    fn div(self, other: &Tensor) -> Tensor {
+        (&self).div(other)
+    }
+}
+
+impl Div<Tensor> for &Tensor {
+    type Output = Tensor;
+    fn div(self, other: Tensor) -> Tensor {
+        self.div(&other)
+    }
+}
+
+impl Div for Tensor {
+    type Output = Tensor;
+    fn div(self, other: Tensor) -> Tensor {
+        (&self).div(&other)
     }
 }

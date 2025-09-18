@@ -1,0 +1,8 @@
+
+[build]
+# keep generic per-crate flags here (no LTO here!)
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3"]
+
+[profile.release]
+lto = "thin"          # or "fat"; use profile instead of rustflags
+codegen-units = 1
