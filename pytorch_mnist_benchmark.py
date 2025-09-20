@@ -1,4 +1,4 @@
-# bench_mnist_mlp.py
+# Pytorch mnist benchmark to compare with examples/train_mnist.rs
 import time, torch, torch.nn as nn, torch.nn.functional as F
 from torchvision import datasets, transforms
 

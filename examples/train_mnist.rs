@@ -1,5 +1,4 @@
-// examples/train_mnist.rs - Complete working MNIST training example
-
+// Complete working MNIST training example
 use mimalloc::MiMalloc;
 
 #[global_allocator]

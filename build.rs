@@ -1,4 +1,3 @@
-// build.rs
 fn main() {
     // Link Apple Accelerate when the feature is enabled
     #[cfg(all(feature = "blas-accelerate", target_os = "macos"))]

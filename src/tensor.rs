@@ -1,4 +1,3 @@
-// tensor.rs - SIMD-optimized tensor implementation using stable Rust
 use crate::{ops, tape::Tape};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};

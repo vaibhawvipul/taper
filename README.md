@@ -1,27 +1,24 @@
 # taper
-A simple neural network library in Rust.
+A lightweight neural network library in Rust with automatic differentiation.
 
-This library is an autograd engine with dynamic computational graph and neural network library implemented from scratch in Rust. It supports basic tensor operations, automatic differentiation, and simple neural network layers.
+## Features
+- Dynamic computational graph with tape-based autograd
+- SIMD-optimized tensor operations (AVX/SSE/NEON)
+- Neural network layers: Linear, ReLU, Sigmoid
+- Optimizers: SGD, Adam, AdamW with learning rate scheduling
+- Loss functions: MSE, Cross-entropy, BCE
+- MNIST dataset support with data loading utilities
 
-We support -
-- Basic tensor operations (addition, multiplication, etc.)
-- Automatic differentiation
-- Simple neural network layers (Linear, ReLU, Sigmoid)
-- Sequential model container
-- Mean Squared Error loss
-- Stochastic Gradient Descent optimizer
-- Training a simple model (XOR problem)
+## Performance
+- Optional BLAS acceleration for matrix operations
+- Cross-platform SIMD optimizations
+- Memory-efficient gradient computation
 
-This is currently a work-in-progress and is not optimized for performance. SIMD optimizations are being worked on. The code is partially zero-copy, it needs more work.
-
-## Example
-
+## Usage
 ```sh
-cargo run
-```
+# Basic training
+cargo run --example train_mnist
 
-With full BLAS acceleration -
-
-```sh
+# With BLAS acceleration
 cargo run --release --features blas-accelerate --example train_mnist
 ```
