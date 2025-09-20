@@ -987,4 +987,665 @@ impl Tensor {
     pub fn view(&self, shape: &[usize]) -> Tensor {
         self.reshape(shape)
     }
+
+    /// Efficient 2D convolution using im2col + GEMM approach
+    /// Input: [N, C_in, H, W], Weight: [C_out, C_in, K_h, K_w]
+    /// Output: [N, C_out, H_out, W_out]
+    pub fn conv2d(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+    ) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C_in, H, W]");
+        assert_eq!(weight.shape.len(), 4, "Weight must be 4D: [C_out, C_in, K_h, K_w]");
+
+        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (c_out, c_in_w, k_h, k_w) = (weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]);
+
+        assert_eq!(c_in, c_in_w, "Input and weight channel dimensions must match");
+
+        let (stride_h, stride_w) = stride;
+        let (pad_h, pad_w) = padding;
+        let (dil_h, dil_w) = dilation;
+
+        // Calculate output dimensions
+        let h_out = (h_in + 2 * pad_h - dil_h * (k_h - 1) - 1) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - dil_w * (k_w - 1) - 1) / stride_w + 1;
+
+        // im2col transformation
+        let k = c_in * k_h * k_w;
+        let col_matrix = self.im2col_optimized(k_h, k_w, stride, padding, dilation); // [NW, K]
+
+        // reshape weights as [K, C_out] (no transpose needed)
+        let weight_reshaped = weight.reshape(&[k, c_out]);
+
+        // now: [NW, K] @ [K, C_out] -> [NW, C_out], zero extra copy
+        let output_2d = col_matrix.matmul(&weight_reshaped);
+        // col_matrix shape: [N * H_out * W_out, C_in * K_h * K_w]
+
+        // Reshape weight for GEMM: [C_out, C_in * K_h * K_w]
+        // let weight_reshaped = weight.reshape(&[c_out, c_in * k_h * k_w]);
+
+        // // GEMM: [N * H_out * W_out, C_out] = [N * H_out * W_out, C_in * K_h * K_w] @ [C_in * K_h * K_w, C_out]
+        // let output_2d = col_matrix.matmul(&weight_reshaped.transpose());
+
+        // Reshape back to 4D: [N, H_out, W_out, C_out] -> [N, C_out, H_out, W_out]
+        let mut output = output_2d.reshape(&[n, h_out, w_out, c_out]);
+        output = output.transpose_4d(&[0, 3, 1, 2]); // NHWC -> NCHW
+
+        // Add bias if provided
+        if let Some(b) = bias {
+            assert_eq!(b.shape(), &[c_out], "Bias must be 1D with C_out elements");
+            output = output.add_bias_4d(b);
+        }
+
+        output
+    }
+
+    /// Fused convolution + ReLU operation for better performance
+    pub fn conv2d_relu(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+    ) -> Tensor {
+        let conv_out = self.conv2d(weight, bias, stride, padding, dilation);
+        conv_out.relu_inplace()
+    }
+
+    /// 2D Max Pooling
+    /// Input: [N, C, H, W], Output: [N, C, H_out, W_out]
+    pub fn max_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: Option<(usize, usize)>,
+        padding: (usize, usize),
+    ) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C, H, W]");
+
+        let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (k_h, k_w) = kernel_size;
+        let (s_h, s_w) = stride.unwrap_or(kernel_size);
+        let (pad_h, pad_w) = padding;
+
+        let h_out = (h_in + 2 * pad_h - k_h) / s_h + 1;
+        let w_out = (w_in + 2 * pad_w - k_w) / s_w + 1;
+
+        let data = self.data();
+        let mut output_data = vec![f32::NEG_INFINITY; n * c * h_out * w_out];
+
+        // Efficient pooling with proper indexing
+        for batch in 0..n {
+            for channel in 0..c {
+                for out_h in 0..h_out {
+                    for out_w in 0..w_out {
+                        let mut max_val = f32::NEG_INFINITY;
+
+                        for k_row in 0..k_h {
+                            for k_col in 0..k_w {
+                                let in_h = out_h * s_h + k_row;
+                                let in_w = out_w * s_w + k_col;
+
+                                if in_h >= pad_h && in_w >= pad_w {
+                                    let in_h = in_h - pad_h;
+                                    let in_w = in_w - pad_w;
+
+                                    if in_h < h_in && in_w < w_in {
+                                        let in_idx = batch * c * h_in * w_in +
+                                                   channel * h_in * w_in +
+                                                   in_h * w_in + in_w;
+                                        max_val = max_val.max(data[in_idx]);
+                                    }
+                                }
+                            }
+                        }
+
+                        let out_idx = batch * c * h_out * w_out +
+                                     channel * h_out * w_out +
+                                     out_h * w_out + out_w;
+                        output_data[out_idx] = max_val;
+                    }
+                }
+            }
+        }
+
+        let mut output = Tensor::new(output_data, &[n, c, h_out, w_out]);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+            let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
+            let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    let mut slot = input.grad.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(vec![0.0; n * c * h_in * w_in]);
+                    }
+                    let gin = slot.as_mut().unwrap();
+                    let in_data = input.data();
+
+                    // Backpropagate gradients through max pooling
+                    for batch in 0..n {
+                        for channel in 0..c {
+                            for out_h in 0..h_out {
+                                for out_w in 0..w_out {
+                                    let mut max_val = f32::NEG_INFINITY;
+                                    let mut max_pos = (0, 0);
+
+                                    // Find the position of maximum value
+                                    for k_row in 0..k_h {
+                                        for k_col in 0..k_w {
+                                            let in_h = out_h * s_h + k_row;
+                                            let in_w = out_w * s_w + k_col;
+
+                                            if in_h >= pad_h && in_w >= pad_w {
+                                                let in_h = in_h - pad_h;
+                                                let in_w = in_w - pad_w;
+
+                                                if in_h < h_in && in_w < w_in {
+                                                    let in_idx = batch * c * h_in * w_in +
+                                                               channel * h_in * w_in +
+                                                               in_h * w_in + in_w;
+                                                    if in_data[in_idx] > max_val {
+                                                        max_val = in_data[in_idx];
+                                                        max_pos = (in_h, in_w);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Add gradient to the maximum position
+                                    let out_idx = batch * c * h_out * w_out +
+                                                 channel * h_out * w_out +
+                                                 out_h * w_out + out_w;
+                                    let in_idx = batch * c * h_in * w_in +
+                                               channel * h_in * w_in +
+                                               max_pos.0 * w_in + max_pos.1;
+                                    gin[in_idx] += gout[out_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        output
+    }
+
+    /// 2D Average Pooling
+    pub fn avg_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: Option<(usize, usize)>,
+        padding: (usize, usize),
+    ) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C, H, W]");
+
+        let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (k_h, k_w) = kernel_size;
+        let (s_h, s_w) = stride.unwrap_or(kernel_size);
+        let (pad_h, pad_w) = padding;
+
+        let h_out = (h_in + 2 * pad_h - k_h) / s_h + 1;
+        let w_out = (w_in + 2 * pad_w - k_w) / s_w + 1;
+
+        let data = self.data();
+        let mut output_data = vec![0.0; n * c * h_out * w_out];
+        let pool_size = (k_h * k_w) as f32;
+
+        for batch in 0..n {
+            for channel in 0..c {
+                for out_h in 0..h_out {
+                    for out_w in 0..w_out {
+                        let mut sum = 0.0;
+
+                        for k_row in 0..k_h {
+                            for k_col in 0..k_w {
+                                let in_h = out_h * s_h + k_row;
+                                let in_w = out_w * s_w + k_col;
+
+                                if in_h >= pad_h && in_w >= pad_w {
+                                    let in_h = in_h - pad_h;
+                                    let in_w = in_w - pad_w;
+
+                                    if in_h < h_in && in_w < w_in {
+                                        let in_idx = batch * c * h_in * w_in +
+                                                   channel * h_in * w_in +
+                                                   in_h * w_in + in_w;
+                                        sum += data[in_idx];
+                                    }
+                                }
+                            }
+                        }
+
+                        let out_idx = batch * c * h_out * w_out +
+                                     channel * h_out * w_out +
+                                     out_h * w_out + out_w;
+                        output_data[out_idx] = sum / pool_size;
+                    }
+                }
+            }
+        }
+
+        let mut output = Tensor::new(output_data, &[n, c, h_out, w_out]);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+            let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
+            let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    let mut slot = input.grad.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(vec![0.0; n * c * h_in * w_in]);
+                    }
+                    let gin = slot.as_mut().unwrap();
+                    let pool_size = (k_h * k_w) as f32;
+
+                    // Distribute gradient equally among pooled elements
+                    for batch in 0..n {
+                        for channel in 0..c {
+                            for out_h in 0..h_out {
+                                for out_w in 0..w_out {
+                                    let out_idx = batch * c * h_out * w_out +
+                                                 channel * h_out * w_out +
+                                                 out_h * w_out + out_w;
+                                    let grad_val = gout[out_idx] / pool_size;
+
+                                    for k_row in 0..k_h {
+                                        for k_col in 0..k_w {
+                                            let in_h = out_h * s_h + k_row;
+                                            let in_w = out_w * s_w + k_col;
+
+                                            if in_h >= pad_h && in_w >= pad_w {
+                                                let in_h = in_h - pad_h;
+                                                let in_w = in_w - pad_w;
+
+                                                if in_h < h_in && in_w < w_in {
+                                                    let in_idx = batch * c * h_in * w_in +
+                                                               channel * h_in * w_in +
+                                                               in_h * w_in + in_w;
+                                                    gin[in_idx] += grad_val;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        output
+    }
+
+
+    /// SIMD-optimized im2col transformation
+    fn im2col_optimized(
+        &self,
+        k_h: usize,
+        k_w: usize,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+    ) -> Tensor {
+        let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (stride_h, stride_w) = stride;
+        let (pad_h, pad_w) = padding;
+        let (dil_h, dil_w) = dilation;
+
+        let h_out = (h_in + 2 * pad_h - dil_h * (k_h - 1) - 1) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - dil_w * (k_w - 1) - 1) / stride_w + 1;
+
+        let col_size = c * k_h * k_w;
+        let num_windows = n * h_out * w_out;
+        let mut col_data = vec![0.0; num_windows * col_size];
+
+        let data = self.data();
+
+        // Special case optimizations for common kernel sizes
+        if k_h == 3 && k_w == 3 && stride_h == 1 && stride_w == 1 && dil_h == 1 && dil_w == 1 {
+            self.im2col_3x3_stride1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out, pad_h, pad_w);
+        } else if k_h == 1 && k_w == 1 {
+            self.im2col_1x1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out);
+        } else {
+            // General case with SIMD optimization
+            self.im2col_general_simd(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out,
+                                      k_h, k_w, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w);
+        }
+
+        Tensor::new(col_data, &[num_windows, col_size])
+    }
+
+    /// Highly optimized 3x3 convolution im2col (most common case)
+    #[inline]
+    fn im2col_3x3_stride1(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        n: usize, c: usize, h_in: usize, w_in: usize,
+        h_out: usize, w_out: usize,
+        pad_h: usize, pad_w: usize,
+    ) {
+        let col_size = c * 9; // 3x3 = 9
+
+        // Process in blocks for better cache locality
+        const BLOCK_SIZE: usize = 8;
+
+        for batch in 0..n {
+            let batch_offset = batch * c * h_in * w_in;
+
+            for out_h_block in (0..h_out).step_by(BLOCK_SIZE) {
+                let h_end = (out_h_block + BLOCK_SIZE).min(h_out);
+
+                for out_w_block in (0..w_out).step_by(BLOCK_SIZE) {
+                    let w_end = (out_w_block + BLOCK_SIZE).min(w_out);
+
+                    // Process block
+                    for out_h in out_h_block..h_end {
+                        for out_w in out_w_block..w_end {
+                            let window_idx = batch * h_out * w_out + out_h * w_out + out_w;
+                            let col_base = window_idx * col_size;
+
+                            for ch in 0..c {
+                                let ch_offset = ch * 9;
+
+                                // Unrolled 3x3 kernel
+                                for k_row in 0..3 {
+                                    let in_h = out_h + k_row;
+                                    let in_h_valid = in_h >= pad_h && in_h < h_in + pad_h;
+                                    let in_h_idx = if in_h_valid { in_h - pad_h } else { 0 };
+
+                                    for k_col in 0..3 {
+                                        let in_w = out_w + k_col;
+                                        let col_idx = col_base + ch_offset + k_row * 3 + k_col;
+
+                                        if in_h_valid && in_w >= pad_w && in_w < w_in + pad_w {
+                                            let in_w_idx = in_w - pad_w;
+                                            let in_idx = batch_offset + ch * h_in * w_in +
+                                                    in_h_idx * w_in + in_w_idx;
+                                            output[col_idx] = input[in_idx];
+                                        }
+                                        // else: stays 0.0 (padding)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ultra-fast 1x1 convolution (just reshape)
+    #[inline]
+    fn im2col_1x1(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        _n: usize, _c: usize, h_in: usize, w_in: usize,
+        h_out: usize, w_out: usize,
+    ) {
+        // 1x1 conv is just a reshape - use SIMD memcpy
+        assert_eq!(h_in, h_out);
+        assert_eq!(w_in, w_out);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr(), output.as_mut_ptr(), input.len());
+        }
+    }
+
+    /// General case with SIMD optimizations
+    #[inline]
+    fn im2col_general_simd(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        n: usize, c: usize, h_in: usize, w_in: usize,
+        h_out: usize, w_out: usize,
+        k_h: usize, k_w: usize,
+        stride_h: usize, stride_w: usize,
+        pad_h: usize, pad_w: usize,
+        dil_h: usize, dil_w: usize,
+    ) {
+        let col_size = c * k_h * k_w;
+
+        // Vectorized when copying contiguous regions
+        for batch in 0..n {
+            for out_h in 0..h_out {
+                for out_w in 0..w_out {
+                    let window_idx = batch * h_out * w_out + out_h * w_out + out_w;
+                    let col_base = window_idx * col_size;
+
+                    for ch in 0..c {
+                        for k_row in 0..k_h {
+                            let in_h = out_h * stride_h + k_row * dil_h;
+
+                            if in_h >= pad_h && in_h < h_in + pad_h {
+                                let in_h_idx = in_h - pad_h;
+
+                                // Try to copy entire rows when possible (SIMD opportunity)
+                                let mut consecutive_count = 0;
+                                let mut start_k_col = 0;
+
+                                for k_col in 0..k_w {
+                                    let in_w = out_w * stride_w + k_col * dil_w;
+
+                                    if in_w >= pad_w && in_w < w_in + pad_w && consecutive_count == k_col - start_k_col {
+                                        consecutive_count += 1;
+                                    } else {
+                                        // Copy accumulated consecutive elements
+                                        if consecutive_count > 0 {
+                                            self.copy_consecutive_elements(
+                                                input, output, batch, ch, h_in, w_in,
+                                                in_h_idx, out_w * stride_w + start_k_col * dil_w - pad_w,
+                                                col_base + ch * k_h * k_w + k_row * k_w + start_k_col,
+                                                consecutive_count
+                                            );
+                                        }
+
+                                        // Handle non-consecutive element
+                                        let col_idx = col_base + ch * k_h * k_w + k_row * k_w + k_col;
+
+                                        if in_w >= pad_w && in_w < w_in + pad_w {
+                                            let in_w_idx = in_w - pad_w;
+                                            let in_idx = batch * c * h_in * w_in +
+                                                    ch * h_in * w_in +
+                                                    in_h_idx * w_in + in_w_idx;
+                                            output[col_idx] = input[in_idx];
+                                        }
+
+                                        start_k_col = k_col + 1;
+                                        consecutive_count = 0;
+                                    }
+                                }
+
+                                // Handle remaining consecutive elements
+                                if consecutive_count > 0 {
+                                    self.copy_consecutive_elements(
+                                        input, output, batch, ch, h_in, w_in,
+                                        in_h_idx, out_w * stride_w + start_k_col * dil_w - pad_w,
+                                        col_base + ch * k_h * k_w + k_row * k_w + start_k_col,
+                                        consecutive_count
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// SIMD-optimized copy of consecutive elements
+    #[inline]
+    fn copy_consecutive_elements(
+        &self,
+        input: &[f32], output: &mut [f32],
+        batch: usize, ch: usize, h_in: usize, w_in: usize,
+        in_h: usize, in_w_start: usize,
+        out_start: usize, count: usize
+    ) {
+        if count >= 8 && in_w_start + count <= w_in {
+            // Use SIMD for larger copies
+            let in_base = batch * ch * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w_start;
+
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx") && count >= 8 {
+                        use std::arch::x86_64::*;
+                        let chunks = count / 8;
+                        for i in 0..chunks {
+                            let v = _mm256_loadu_ps(input.as_ptr().add(in_base + i * 8));
+                            _mm256_storeu_ps(output.as_mut_ptr().add(out_start + i * 8), v);
+                        }
+
+                        // Handle remainder
+                        for i in (chunks * 8)..count {
+                            output[out_start + i] = input[in_base + i];
+                        }
+                        return;
+                    }
+                }
+
+                // Fallback: vectorizable memcpy
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().add(in_base),
+                    output.as_mut_ptr().add(out_start),
+                    count
+                );
+            }
+        } else {
+            // Scalar copy for small counts
+            for i in 0..count {
+                let in_w = in_w_start + i;
+                if in_w < w_in {
+                    let in_idx = batch * ch * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w;
+                    output[out_start + i] = input[in_idx];
+                }
+            }
+        }
+    }
+
+    /// Helper: Add bias to 4D tensor (broadcast along channel dimension)
+    fn add_bias_4d(&self, bias: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 4);
+        assert_eq!(bias.shape.len(), 1);
+        assert_eq!(self.shape[1], bias.shape[0]); // C_out
+
+        let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let self_data = self.data();
+        let bias_data = bias.data();
+
+        let mut result_data = vec![0.0; self_data.len()];
+
+        for batch in 0..n {
+            for channel in 0..c {
+                let bias_val = bias_data[channel];
+                let base_idx = batch * c * h * w + channel * h * w;
+
+                for spatial in 0..(h * w) {
+                    result_data[base_idx + spatial] = self_data[base_idx + spatial] + bias_val;
+                }
+            }
+        }
+
+        let mut output = Tensor::new(result_data, &self.shape);
+
+        if self.requires_grad || bias.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let bias_t = bias.clone();
+            let out = output.clone();
+            let (n, c, h, w) = (n, c, h, w);
+
+            Tape::push_binary_op(self, bias, &output, move || {
+                if let Some(gout) = out.grad.borrow().as_ref() {
+                    if input.requires_grad {
+                        ops::accumulate_grad(&input, gout);
+                    }
+
+                    if bias_t.requires_grad {
+                        let mut slot = bias_t.grad.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(vec![0.0; c]);
+                        }
+                        let gb = slot.as_mut().unwrap();
+
+                        // Sum gradients across N, H, W dimensions for each channel
+                        for batch in 0..n {
+                            for channel in 0..c {
+                                let base_idx = batch * c * h * w + channel * h * w;
+                                for spatial in 0..(h * w) {
+                                    gb[channel] += gout[base_idx + spatial];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        output
+    }
+
+    /// Helper: 4D tensor transpose for dimension reordering
+    fn transpose_4d(&self, axes: &[usize; 4]) -> Tensor {
+        assert_eq!(self.shape.len(), 4);
+
+        let old_shape = &self.shape;
+        let new_shape = [old_shape[axes[0]], old_shape[axes[1]], old_shape[axes[2]], old_shape[axes[3]]];
+
+        let data = self.data();
+        let mut result_data = vec![0.0; data.len()];
+
+        let (d0, d1, d2, d3) = (old_shape[0], old_shape[1], old_shape[2], old_shape[3]);
+
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                for i2 in 0..d2 {
+                    for i3 in 0..d3 {
+                        let old_idx = i0 * d1 * d2 * d3 + i1 * d2 * d3 + i2 * d3 + i3;
+
+                        let new_indices = [i0, i1, i2, i3];
+                        let (n0, n1, n2, n3) = (
+                            new_indices[axes[0]],
+                            new_indices[axes[1]],
+                            new_indices[axes[2]],
+                            new_indices[axes[3]]
+                        );
+
+                        let new_idx = n0 * new_shape[1] * new_shape[2] * new_shape[3] +
+                                     n1 * new_shape[2] * new_shape[3] +
+                                     n2 * new_shape[3] + n3;
+
+                        result_data[new_idx] = data[old_idx];
+                    }
+                }
+            }
+        }
+
+        Tensor::new(result_data, &new_shape)
+    }
+
+    /// In-place ReLU for fusion operations
+    fn relu_inplace(self) -> Tensor {
+        self.relu()
+    }
 }
