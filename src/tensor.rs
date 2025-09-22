@@ -41,7 +41,7 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
         {
             if is_x86_feature_detected!("sse2") {
-                add_f32_sse2(a, b, out);
+                add_f32_sse(a, b, out);
                 return;
             }
         }
