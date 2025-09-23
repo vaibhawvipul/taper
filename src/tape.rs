@@ -1,16 +1,16 @@
-use std::cell::RefCell;
+use std::sync::{Arc, RwLock};
 use std::rc::Rc;
 
 use crate::tensor::Tensor;
 
 thread_local! {
-    // Thread-local active tape; allocated on demand.
-    static TAPE: RefCell<Option<Rc<RefCell<TapeInner>>>> = RefCell::new(None);
+    static TAPE: std::cell::RefCell<Option<Arc<RwLock<TapeInner>>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[allow(dead_code)]
 pub struct Tape {
-    inner: Rc<RefCell<TapeInner>>,
+    inner: Arc<RwLock<TapeInner>>,
 }
 
 struct TapeInner {
@@ -34,7 +34,7 @@ impl Tape {
     pub fn ensure_active() {
         TAPE.with(|t| {
             if t.borrow().is_none() {
-                *t.borrow_mut() = Some(Rc::new(RefCell::new(TapeInner { nodes: Vec::new() })));
+                *t.borrow_mut() = Some(Arc::new(RwLock::new(TapeInner { nodes: Vec::new() })));
             }
         });
     }
@@ -43,7 +43,7 @@ impl Tape {
     pub fn reset() {
         TAPE.with(|t| {
             if let Some(rc) = t.borrow().as_ref().cloned() {
-                rc.borrow_mut().nodes.clear();
+                rc.write().unwrap().nodes.clear();
             }
         });
     }
@@ -61,7 +61,7 @@ impl Tape {
         let rc_opt = TAPE.with(|tape| tape.borrow().as_ref().cloned());
         if let Some(rc) = rc_opt {
             let id = {
-                let mut inner = rc.borrow_mut();
+                let mut inner = rc.write().unwrap();
                 let id = inner.nodes.len();
                 inner.nodes.push(Node {
                     backward_fn: Rc::new(backward_fn),
@@ -69,7 +69,7 @@ impl Tape {
                 id
             };
             // stamp after releasing inner borrow
-            output.tape_node.set(Some(id));
+            output.tape_node.store(id, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -85,14 +85,14 @@ impl Tape {
         let rc_opt = TAPE.with(|tape| tape.borrow().as_ref().cloned());
         if let Some(rc) = rc_opt {
             let id = {
-                let mut inner = rc.borrow_mut();
+                let mut inner = rc.write().unwrap();
                 let id = inner.nodes.len();
                 inner.nodes.push(Node {
                     backward_fn: Rc::new(backward_fn),
                 });
                 id
             };
-            output.tape_node.set(Some(id));
+            output.tape_node.store(id, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -105,7 +105,7 @@ pub fn backward(final_node_id: usize) {
         let Some(rc) = t.borrow().as_ref().cloned() else {
             return Vec::new();
         };
-        let inner = rc.borrow();
+        let inner = rc.read().unwrap();
         if inner.nodes.is_empty() {
             return Vec::new();
         }

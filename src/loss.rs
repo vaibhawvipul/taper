@@ -32,7 +32,7 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
         let n = p.len();
 
         Tape::push_binary_op(predictions, targets, &out, move || {
-            if let Some(gout) = out_clone.grad.borrow().as_ref() {
+            if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
                 let g = gout[0]; // scalar chain multiplier from upstream
 
                 let pdat = preds.data();
@@ -40,7 +40,7 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
 
                 // dL/dp_i = -( y/p - (1-y)/(1-p) ) / N
                 if preds.requires_grad {
-                    let mut slot = preds.grad.borrow_mut();
+                    let mut slot = preds.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n]);
                     }
@@ -55,7 +55,7 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
                 // Optional (usually false for labels):
                 // dL/dy_i = -ln(p_i) + ln(1 - p_i) = ln((1-p)/p), divided by N
                 if targs.requires_grad {
-                    let mut slot = targs.grad.borrow_mut();
+                    let mut slot = targs.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n]);
                     }
@@ -172,7 +172,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Tensor {
         let out_c = out.clone();
 
         Tape::push_unary_op(logits, &out, move || {
-            if let Some(g) = out_c.grad.borrow().as_ref() {
+            if let Some(g) = out_c.grad.read().unwrap().as_ref() {
                 let b = logits_c.shape()[0];
                 let c = logits_c.shape()[1];
                 let mut grad = logp_c.exp().data().clone(); // softmax
@@ -226,7 +226,7 @@ pub fn cross_entropy_loss_onehot(logits: &Tensor, targets: &Tensor) -> Tensor {
         let loss_out = loss.clone();
 
         Tape::push_unary_op(logits, &loss, move || {
-            if let Some(gloss) = loss_out.grad.borrow().as_ref() {
+            if let Some(gloss) = loss_out.grad.write().unwrap().as_ref() {
                 // Gradient: (softmax - targets) * grad_loss / batch_size
                 let probs = log_softmax(&logits_clone, -1).exp();
                 let grad_data: Vec<f32> = probs

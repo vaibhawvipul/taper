@@ -1,10 +1,10 @@
 use crate::{ops, tape::Tape};
 use smallvec::SmallVec;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::{sync::{atomic::Ordering, RwLockReadGuard, RwLockWriteGuard}};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::sync::{Arc, RwLock};
 
 // SIMD utility module for cross-platform support
 pub mod simd {
@@ -227,20 +227,23 @@ pub mod simd {
 
 #[derive(Clone)]
 pub struct Tensor {
-    data: Rc<RefCell<Vec<f32>>>,
+    // Use RwLock for read-heavy workloads (most operations read data)
+    data: Arc<RwLock<Vec<f32>>>,
     pub(crate) shape: SmallVec<[usize; 4]>,
-    pub grad: Rc<RefCell<Option<Vec<f32>>>>,
+    pub grad: Arc<RwLock<Option<Vec<f32>>>>,
     pub requires_grad: bool,
-    pub tape_node: Cell<Option<usize>>,
+    pub tape_node: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.data();
+        let has_grad = self.grad.read().unwrap().is_some();
         f.debug_struct("Tensor")
-            .field("data", &self.data.borrow().as_slice())
+            .field("data", &data.as_slice())
             .field("shape", &self.shape)
             .field("requires_grad", &self.requires_grad)
-            .field("has_grad", &self.grad.borrow().is_some())
+            .field("has_grad", &has_grad)
             .finish()
     }
 }
@@ -248,11 +251,11 @@ impl std::fmt::Debug for Tensor {
 impl Tensor {
     pub fn new(data: Vec<f32>, shape: &[usize]) -> Self {
         Tensor {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape: shape.iter().cloned().collect(),
-            grad: Rc::new(RefCell::new(None)),
+            grad: Arc::new(RwLock::new(None)),
             requires_grad: false,
-            tape_node: Cell::new(None),
+            tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -269,39 +272,46 @@ impl Tensor {
         &self.shape
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<f32>> {
-        self.data.borrow()
+    #[inline]
+    pub fn data(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+        self.data.read().expect("data RwLock poisoned")
     }
 
-    pub fn grad_ref(&self) -> Option<std::cell::Ref<'_, Vec<f32>>> {
-        let r = self.grad.borrow();
-        if r.is_some() {
-            Some(std::cell::Ref::map(r, |opt| opt.as_ref().unwrap()))
-        } else {
-            None
-        }
+    #[inline]
+    pub fn data_mut(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
+        self.data.write().expect("data RwLock poisoned")
     }
 
-    pub fn grad(&self) -> Option<Rc<Tensor>> {
-        let r = self.grad.borrow();
-        r.as_ref().map(|g| {
-            let mut t = Tensor::new(g.clone(), &self.shape);
+    /// Read-only view of grad vector if it exists
+    #[inline]
+    pub fn grad_ref(&self) -> Option<std::sync::Arc<Vec<f32>>> {
+        let g = self.grad.read().expect("grad RwLock poisoned");
+        g.as_ref().map(|v| std::sync::Arc::new(v.clone()))
+    }
+
+    /// Convenience: clone grads into a new non-requiring-grad Tensor
+    pub fn grad(&self) -> Option<Arc<Tensor>> {
+        let g = self.grad.read().expect("grad RwLock poisoned");
+        g.as_ref().map(|v| {
+            let mut t = Tensor::new(v.clone(), &self.shape);
             t.requires_grad = false;
-            Rc::new(t)
+            Arc::new(t)
         })
     }
 
     pub fn backward(&self) {
         let ones = vec![1.0; self.data().len()];
-        *self.grad.borrow_mut() = Some(ones);
+        *self.grad.write().unwrap() = Some(ones);
 
-        if let Some(node_id) = self.tape_node.get() {
+        // Use AtomicUsize::load; define a sentinel like 0 = “no node”
+        let node_id = self.tape_node.load(Ordering::SeqCst);
+        if node_id != 0 {
             crate::tape::backward(node_id);
         }
     }
 
     pub fn zero_grad(&self) {
-        *self.grad.borrow_mut() = None;
+        *self.grad.write().unwrap() = None;
     }
 
     pub fn from_data(&self, data: Vec<f32>, shape: &[usize]) -> Tensor {
@@ -310,10 +320,6 @@ impl Tensor {
             tensor.requires_grad = true;
         }
         tensor
-    }
-
-    pub fn data_mut(&self) -> std::cell::RefMut<'_, Vec<f32>> {
-        self.data.borrow_mut()
     }
 
     /// Cache-friendly blocked transpose
@@ -350,8 +356,8 @@ impl Tensor {
             let (rows, cols) = (rows, cols);
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
-                    let mut slot = input.grad.borrow_mut();
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; rows * cols]);
                     }
@@ -393,9 +399,9 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     let y = out.data();
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; y.len()]);
                     }
@@ -446,13 +452,13 @@ impl Tensor {
                 let (batch_size, features) = (batch_size, features);
 
                 Tape::push_binary_op(self, other, &output, move || {
-                    if let Some(gout) = out.grad.borrow().as_ref() {
+                    if let Some(gout) = out.grad.read().unwrap().as_ref() {
                         if a.requires_grad {
                             ops::accumulate_grad(&a, gout);
                         }
 
                         if b.requires_grad {
-                            let mut slot = b.grad.borrow_mut();
+                            let mut slot = b.grad.write().unwrap();
                             if slot.is_none() {
                                 *slot = Some(vec![0.0; features]);
                             }
@@ -517,7 +523,7 @@ impl Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.borrow().as_ref() {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
                     // dL/dA = gout
                     if a.requires_grad {
                         ops::accumulate_grad(&a, gout);
@@ -557,9 +563,9 @@ impl Tensor {
             let n = data.len() as f32;
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     let g_each = gout[0] / n;
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; input.data().len()]);
                     }
@@ -595,9 +601,9 @@ impl Tensor {
             // let orig_shape = self.shape.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // Gradient just needs to be reshaped back
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; gout.len()]);
                     }
@@ -721,8 +727,8 @@ impl Tensor {
                 let d = d;
 
                 Tape::push_unary_op(self, &output, move || {
-                    if let Some(gout) = out.grad.borrow().as_ref() {
-                        let mut slot = input.grad.borrow_mut();
+                    if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                        let mut slot = input.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; input.data().len()]);
                         }
@@ -778,7 +784,7 @@ impl Tensor {
                 let size = data.len();
 
                 Tape::push_unary_op(self, &output, move || {
-                    if let Some(gout) = out.grad.borrow().as_ref() {
+                    if let Some(gout) = out.grad.read().unwrap().as_ref() {
                         // Each element gets the same gradient
                         let grad_val = gout[0];
                         let grad_vec = vec![grad_val; size];
@@ -880,10 +886,10 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx e^x = e^x
                     let exp_x = out.data();
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; exp_x.len()]);
                     }
@@ -922,10 +928,10 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx ln(x) = 1/x
                     let x = input.data();
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; x.len()]);
                     }
@@ -959,10 +965,10 @@ impl Tensor {
             let exp = exp;
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx x^n = n * x^(n-1)
                     let x = input.data();
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; x.len()]);
                     }
@@ -1124,8 +1130,8 @@ impl Tensor {
             let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
-                    let mut slot = input.grad.borrow_mut();
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n * c * h_in * w_in]);
                     }
@@ -1247,8 +1253,8 @@ impl Tensor {
             let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
-                    let mut slot = input.grad.borrow_mut();
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n * c * h_in * w_in]);
                     }
@@ -1576,13 +1582,13 @@ impl Tensor {
             let (n, c, h, w) = (n, c, h, w);
 
             Tape::push_binary_op(self, bias, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     if input.requires_grad {
                         ops::accumulate_grad(&input, gout);
                     }
 
                     if bias_t.requires_grad {
-                        let mut slot = bias_t.grad.borrow_mut();
+                        let mut slot = bias_t.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; c]);
                         }

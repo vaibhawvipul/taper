@@ -32,7 +32,7 @@ impl Add for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.borrow().as_ref() {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
                     if a.requires_grad {
                         accumulate_grad(&a, gout);
                     }
@@ -73,10 +73,10 @@ impl Mul for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.borrow().as_ref() {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
                     if a.requires_grad {
                         let bdat = b.data();
-                        let mut slot = a.grad.borrow_mut();
+                        let mut slot = a.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; bdat.len()]);
                         }
@@ -93,7 +93,7 @@ impl Mul for &Tensor {
                     }
                     if b.requires_grad {
                         let adat = a.data();
-                        let mut slot = b.grad.borrow_mut();
+                        let mut slot = b.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; adat.len()]);
                         }
@@ -118,7 +118,7 @@ impl Mul for &Tensor {
 // Helper function to accumulate gradients with SIMD
 #[inline]
 pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
-    let mut slot = t.grad.borrow_mut();
+    let mut slot = t.grad.write().unwrap();
     if slot.is_none() {
         *slot = Some(vec![0.0; t.data().len()]);
     }
@@ -134,7 +134,7 @@ pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
 
 #[inline]
 pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
-    let mut slot = t.grad.borrow_mut();
+    let mut slot = t.grad.write().unwrap();
     if slot.is_none() {
         *slot = Some(vec![0.0; t.data().len()]);
     }
@@ -232,7 +232,7 @@ impl Tensor {
             let b_shape = other.shape.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout_vec) = out_t.grad.borrow().as_ref() {
+                if let Some(gout_vec) = out_t.grad.read().unwrap().as_ref() {
                     let gout = &gout_vec[..];
 
                     // dA += dC * B^T   (m×k) = (m×n_out) * (n_out×k)
@@ -242,7 +242,7 @@ impl Tensor {
                         let n_out = b_shape[1] as i32;
 
                         let bdat = b_t.data();
-                        let mut slot = a_t.grad.borrow_mut();
+                        let mut slot = a_t.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; (m * k) as usize]);
                         }
@@ -268,7 +268,7 @@ impl Tensor {
                         let m = a_shape[0] as i32;
 
                         let adat = a_t.data();
-                        let mut slot = b_t.grad.borrow_mut();
+                        let mut slot = b_t.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; (kdim * n_out) as usize]);
                         }
@@ -352,9 +352,9 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.borrow().as_ref() {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     let x = input.data();
-                    let mut slot = input.grad.borrow_mut();
+                    let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; x.len()]);
                     }
@@ -397,7 +397,7 @@ impl Sub for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.borrow().as_ref() {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
                     if a.requires_grad {
                         accumulate_grad(&a, gout);
                     }
@@ -460,10 +460,10 @@ impl Div for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.borrow().as_ref() {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
                     if a.requires_grad {
                         let bdat = b.data();
-                        let mut slot = a.grad.borrow_mut();
+                        let mut slot = a.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; bdat.len()]);
                         }
@@ -475,7 +475,7 @@ impl Div for &Tensor {
                     if b.requires_grad {
                         let adat = a.data();
                         let bdat = b.data();
-                        let mut slot = b.grad.borrow_mut();
+                        let mut slot = b.grad.write().unwrap();
                         if slot.is_none() {
                             *slot = Some(vec![0.0; adat.len()]);
                         }
