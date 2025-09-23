@@ -16,6 +16,9 @@ A lightweight neural network library in Rust with automatic differentiation.
 - Cross-platform SIMD optimizations
 - Memory-efficient gradient computation
 
+- gets 99% accuracy on MNIST with a simple MLP in 10 epochs under 2 seconds (with BLAS).
+- gets 96% accuracy on MNIST with a simple CNN in 50 epochs, around 20 seconds per epoch (with BLAS).
+
 ## Technical Implementation
 
 - Operation Fusion: Combines multiple ops (Conv+ReLU) into single kernels to reduce memory traffic
@@ -30,6 +33,6 @@ cargo run --example train_mnist
 # With BLAS acceleration (98% accuracy in 10 epochs)
 cargo run --release --features blas-accelerate --example train_mnist
 
-# Or MNIST CNN training (around 95% accuracy in 50 epochs)
+# Or MNIST CNN training (around 96% accuracy in 50 epochs)
 cargo run --release --features blas-accelerate --example train_mnist_cnn
 ```
