@@ -13,7 +13,7 @@ device_mps = torch.device("mps") if use_mps else None
 
 # for fair CPU compare: match your BLAS threading
 # (adjust to your cores; you can also export VECLIB_MAXIMUM_THREADS)
-torch.set_num_threads(8)
+torch.set_num_threads(12)
 
 transform = transforms.Compose([
     transforms.ToTensor(),            # [1,28,28] float32 in [0,1]

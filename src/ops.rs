@@ -14,13 +14,17 @@ impl Add for &Tensor {
             "Tensor dimensions must match"
         );
 
-        let self_data = self.data();
-        let other_data = other.data();
-        let mut out_data = vec![0.0; self_data.len()];
+        // Clone data ONCE at the start
+        let (a_data, b_data) = {
+            let a = self.data();
+            let b = other.data();
+            (a.clone(), b.clone())
+        };
+        let mut out_data = vec![0.0; a_data.len()];
 
         // Use SIMD operations
         unsafe {
-            simd::add_f32_simd(&self_data, &other_data, &mut out_data);
+            simd::add_f32_simd(&a_data, &b_data, &mut out_data);
         }
 
         let mut out = Tensor::new(out_data, &self.shape);

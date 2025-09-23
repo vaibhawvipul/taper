@@ -16,8 +16,9 @@ A lightweight neural network library in Rust with automatic differentiation.
 - Cross-platform SIMD optimizations
 - Memory-efficient gradient computation
 
-- gets 99% accuracy on MNIST with a simple MLP in 10 epochs under 2 seconds (with BLAS).
-- gets 96% accuracy on MNIST with a simple CNN in 50 epochs, around 20 seconds per epoch (with BLAS).
+Note - Following numbers are on MacBook Pro M4 Pro (12 cores) -
+- gets ~99% accuracy on MNIST with a simple MLP in 10 epochs under 2 seconds total time (with BLAS). Pytorch equivalent takes ~1.5 seconds per epoch, i.e. ~15 seconds total time.
+- gets ~96% accuracy on MNIST with a simple CNN in 50 epochs, around 13 seconds per epoch (with BLAS). Pytorch equivalent takes ~120 seconds per epoch.
 
 ## Technical Implementation
 

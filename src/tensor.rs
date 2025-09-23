@@ -2,6 +2,8 @@ use crate::{ops, tape::Tape};
 use smallvec::SmallVec;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
+use rayon::prelude::*;
+
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::sync::{Arc, RwLock};
@@ -328,9 +330,7 @@ impl Tensor {
 
         let rows = self.shape[0];
         let cols = self.shape[1];
-        let data = self.data();
-
-        // Use cache-friendly blocked transpose
+        let data = self.data().clone(); // Clone once, no more locks
         let mut result = vec![0.0; data.len()];
         let block_size = 16; // Optimal for most cache sizes
 
@@ -376,7 +376,7 @@ impl Tensor {
 
     /// SIMD-optimized sigmoid using fast approximation
     pub fn sigmoid(&self) -> Tensor {
-        let data = self.data();
+        let data = self.data().clone();
         let mut result = vec![0.0; data.len()];
 
         // Fast sigmoid approximation: σ(x) ≈ 0.5 + 0.5 * tanh(0.5 * x)
@@ -397,16 +397,17 @@ impl Tensor {
             output.requires_grad = true;
             let input = self.clone();
             let out = output.clone();
+            let out_data = output.data().clone(); // Clone output data BEFORE closure
 
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out.grad.read().unwrap().as_ref() {
-                    let y = out.data();
+                    // Use out_data instead of out.data()
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
-                        *slot = Some(vec![0.0; y.len()]);
+                        *slot = Some(vec![0.0; out_data.len()]);
                     }
                     let gin = slot.as_mut().unwrap();
-                    for ((gi, &g), &s) in gin.iter_mut().zip(gout.iter()).zip(y.iter()) {
+                    for ((gi, &g), &s) in gin.iter_mut().zip(gout.iter()).zip(out_data.iter()) {
                         *gi += g * s * (1.0 - s);
                     }
                 }
@@ -429,8 +430,11 @@ impl Tensor {
 
             let batch_size = self.shape[0];
             let features = self.shape[1];
-            let self_data = self.data();
-            let other_data = other.data();
+            let (self_data, other_data) = {
+                let a_guard = self.data();
+                let b_guard = other.data();
+                (a_guard.clone(), b_guard.clone()) // Clone data once
+            };
 
             let mut result = vec![0.0; self_data.len()];
 
@@ -869,7 +873,7 @@ impl Tensor {
 
     /// Exponential function (SIMD optimized)
     pub fn exp(&self) -> Tensor {
-        let data = self.data();
+        let data = self.data().clone();
         let mut result = vec![0.0; data.len()];
 
         // SIMD exp using approximation for better performance
@@ -878,17 +882,18 @@ impl Tensor {
             result[i] = x.exp();
         }
 
-        let mut output = Tensor::new(result, &self.shape);
+        let mut output = Tensor::new(result.clone(), &self.shape);
 
         if self.requires_grad {
             output.requires_grad = true;
             let input = self.clone();
             let out = output.clone();
+            let exp_values = result;
 
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx e^x = e^x
-                    let exp_x = out.data();
+                    let exp_x = &exp_values;
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; exp_x.len()]);
@@ -1061,6 +1066,97 @@ impl Tensor {
         }
 
         output
+    }
+
+    pub fn conv2d_direct_3x3(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Tensor {
+        use rayon::prelude::*;
+
+        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (c_out, _, _, _) = (
+            weight.shape[0],
+            weight.shape[1],
+            weight.shape[2],
+            weight.shape[3],
+        );
+
+        let (stride_h, stride_w) = stride;
+        let (pad_h, pad_w) = padding;
+
+        let h_out = (h_in + 2 * pad_h - 2) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - 2) / stride_w + 1;
+
+        let input_data = self.data().clone();
+        let weight_data = weight.data().clone();
+        let mut output = vec![0.0; n * c_out * h_out * w_out];
+
+        // Parallel over batch and output channels
+        output
+            .par_chunks_mut(h_out * w_out)
+            .enumerate()
+            .for_each(|(idx, out_spatial)| {
+                let batch = idx / c_out;
+                let out_ch = idx % c_out;
+
+                // For each output position
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut sum = 0.0;
+
+                        // Convolution kernel - unrolled for 3x3
+                        for in_ch in 0..c_in {
+                            let weight_base = (out_ch * c_in + in_ch) * 9;
+                            let input_base = batch * c_in * h_in * w_in + in_ch * h_in * w_in;
+
+                            // Unrolled 3x3 loop with bounds checking hoisted
+                            for kh in 0..3 {
+                                let ih = oh * stride_h + kh;
+                                if ih < pad_h || ih >= h_in + pad_h {
+                                    continue;
+                                }
+                                let ih_idx = ih - pad_h;
+
+                                for kw in 0..3 {
+                                    let iw = ow * stride_w + kw;
+                                    if iw < pad_w || iw >= w_in + pad_w {
+                                        continue;
+                                    }
+                                    let iw_idx = iw - pad_w;
+
+                                    let in_idx = input_base + ih_idx * w_in + iw_idx;
+                                    let w_idx = weight_base + kh * 3 + kw;
+
+                                    sum += input_data[in_idx] * weight_data[w_idx];
+                                }
+                            }
+                        }
+
+                        out_spatial[oh * w_out + ow] = sum;
+                    }
+                }
+            });
+
+        // Add bias if provided
+        if let Some(b) = bias {
+            let bias_data = b.data().clone();
+            output
+                .par_chunks_mut(h_out * w_out)
+                .enumerate()
+                .for_each(|(idx, out_spatial)| {
+                    let out_ch = idx % c_out;
+                    let bias_val = bias_data[out_ch];
+                    for v in out_spatial.iter_mut() {
+                        *v += bias_val;
+                    }
+                });
+        }
+
+        Tensor::new(output, &[n, c_out, h_out, w_out])
     }
 
     /// Fused convolution + ReLU operation for better performance
@@ -1368,11 +1464,12 @@ impl Tensor {
         let num_windows = n * h_out * w_out;
         let mut col_data = vec![0.0; num_windows * col_size];
 
-        let data = self.data();
+        let data = self.data().clone(); // Clone once to avoid lock contention
 
-        // Special case optimizations for common kernel sizes
+        // Special cases remain the same
         if k_h == 3 && k_w == 3 && stride_h == 1 && stride_w == 1 && dil_h == 1 && dil_w == 1 {
-            self.im2col_3x3_stride1(
+            // Parallelize the 3x3 case
+            self.im2col_3x3_stride1_parallel(
                 &data,
                 &mut col_data,
                 n,
@@ -1385,9 +1482,10 @@ impl Tensor {
                 pad_w,
             );
         } else if k_h == 1 && k_w == 1 {
+            // 1x1 is already optimal
             self.im2col_1x1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out);
         } else {
-            // General case with SIMD optimization
+            // Parallelize general case
             self.im2col_general_simd(
                 &data,
                 &mut col_data,
@@ -1411,13 +1509,11 @@ impl Tensor {
         Tensor::new(col_data, &[num_windows, col_size])
     }
 
-    /// Highly optimized 3x3 convolution im2col (most common case)
-    #[inline]
-    fn im2col_3x3_stride1(
+    fn im2col_3x3_stride1_parallel(
         &self,
         input: &[f32],
         output: &mut [f32],
-        n: usize,
+        _n: usize,
         c: usize,
         h_in: usize,
         w_in: usize,
@@ -1426,56 +1522,45 @@ impl Tensor {
         pad_h: usize,
         pad_w: usize,
     ) {
-        let col_size = c * 9; // 3x3 = 9
+        let col_size = c * 9;
 
-        // Process in blocks for better cache locality
-        const BLOCK_SIZE: usize = 8;
+        // Parallel over batches and output positions
+        output
+            .par_chunks_mut(col_size)
+            .enumerate()
+            .for_each(|(window_idx, out_chunk)| {
+                let batch = window_idx / (h_out * w_out);
+                let pos = window_idx % (h_out * w_out);
+                let out_h = pos / w_out;
+                let out_w = pos % w_out;
 
-        for batch in 0..n {
-            let batch_offset = batch * c * h_in * w_in;
+                let batch_offset = batch * c * h_in * w_in;
 
-            for out_h_block in (0..h_out).step_by(BLOCK_SIZE) {
-                let h_end = (out_h_block + BLOCK_SIZE).min(h_out);
+                for ch in 0..c {
+                    let ch_offset = ch * 9;
 
-                for out_w_block in (0..w_out).step_by(BLOCK_SIZE) {
-                    let w_end = (out_w_block + BLOCK_SIZE).min(w_out);
+                    // Unrolled 3x3 kernel with SIMD-friendly access pattern
+                    for k_row in 0..3 {
+                        let in_h = out_h + k_row;
+                        let in_h_valid = in_h >= pad_h && in_h < h_in + pad_h;
+                        let in_h_idx = if in_h_valid { in_h - pad_h } else { 0 };
 
-                    // Process block
-                    for out_h in out_h_block..h_end {
-                        for out_w in out_w_block..w_end {
-                            let window_idx = batch * h_out * w_out + out_h * w_out + out_w;
-                            let col_base = window_idx * col_size;
+                        for k_col in 0..3 {
+                            let in_w = out_w + k_col;
+                            let idx = ch_offset + k_row * 3 + k_col;
 
-                            for ch in 0..c {
-                                let ch_offset = ch * 9;
-
-                                // Unrolled 3x3 kernel
-                                for k_row in 0..3 {
-                                    let in_h = out_h + k_row;
-                                    let in_h_valid = in_h >= pad_h && in_h < h_in + pad_h;
-                                    let in_h_idx = if in_h_valid { in_h - pad_h } else { 0 };
-
-                                    for k_col in 0..3 {
-                                        let in_w = out_w + k_col;
-                                        let col_idx = col_base + ch_offset + k_row * 3 + k_col;
-
-                                        if in_h_valid && in_w >= pad_w && in_w < w_in + pad_w {
-                                            let in_w_idx = in_w - pad_w;
-                                            let in_idx = batch_offset
-                                                + ch * h_in * w_in
-                                                + in_h_idx * w_in
-                                                + in_w_idx;
-                                            output[col_idx] = input[in_idx];
-                                        }
-                                        // else: stays 0.0 (padding)
-                                    }
-                                }
+                            if in_h_valid && in_w >= pad_w && in_w < w_in + pad_w {
+                                let in_w_idx = in_w - pad_w;
+                                let in_idx =
+                                    batch_offset + ch * h_in * w_in + in_h_idx * w_in + in_w_idx;
+                                out_chunk[idx] = input[in_idx];
+                            } else {
+                                out_chunk[idx] = 0.0;
                             }
                         }
                     }
                 }
-            }
-        }
+            });
     }
 
     /// Ultra-fast 1x1 convolution (just reshape)
