@@ -368,8 +368,8 @@ mod tests {
         let mut optimizer = Adam::new(vec![w.clone(), b.clone()], 0.001, None, None, None);
 
         // Simulate some gradients
-        *w.grad.borrow_mut() = Some(vec![0.1; 100]);
-        *b.grad.borrow_mut() = Some(vec![0.1; 10]);
+        *w.grad.write().unwrap() = Some(vec![0.1; 100]);
+        *b.grad.write().unwrap() = Some(vec![0.1; 10]);
 
         let w_before = w.data().clone();
 
