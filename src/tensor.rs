@@ -306,7 +306,7 @@ impl QuantizedTensor {
     pub fn dequantize(&self) -> Tensor {
         match self {
             QuantizedTensor::Int8(tensor) => tensor.dequantize(),
-            QuantizedTensor::Int4(tensor) => teensor.dequantize(),
+            QuantizedTensor::Int4(tensor) => tensor.dequantize(),
             QuantizedTensor::Float16(tensor) => tensor.dequantize(),
             QuantizedTensor::BFloat16(tensor) => tensor.dequantize(),
             QuantizedTensor::NF4(tensor) => tensor.dequantize(),

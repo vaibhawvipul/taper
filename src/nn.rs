@@ -4,11 +4,17 @@ use rand::{distributions::{Distribution, Uniform}, Rng};
 /// Trait for any differentiable network component.
 pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
-    fn forward_quantized(&self, input: &Tensor, _qconfig: &QuantizationConfig) -> Tensor {
-        // Default implementation: use regular forward pass
-        // Layers with parameters (Linear, Conv2d, etc.) should override this
-        self.forward(input)
+    fn parameters(&self) -> Vec<Tensor>;
+    
+    /// Quantize the model for inference
+    fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        panic!("Quantization not implemented for this module type")
     }
+}
+
+/// Trait for quantized modules used during inference
+pub trait QuantizedModule {
+    fn forward(&self, input: &Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
 }
 
@@ -48,11 +54,11 @@ impl Module for Linear {
         out
     }
 
-    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
-        // For now, always use regular forward pass during training
-        // Quantization should only be used during inference after training
-        // TODO: Implement proper quantized inference mode
-        self.forward(input)
+    fn quantize(&self, qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedLinear {
+            weight: self.weight.quantize(qconfig),
+            bias: self.bias.as_ref().map(|b| b.quantize(qconfig)),
+        })
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -61,6 +67,30 @@ impl Module for Linear {
             p.push(b.clone());
         }
         p
+    }
+}
+
+/// Quantized Linear layer for inference
+pub struct QuantizedLinear {
+    weight: crate::tensor::QuantizedTensor,
+    bias: Option<crate::tensor::QuantizedTensor>,
+}
+
+impl QuantizedModule for QuantizedLinear {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let weight_f32 = self.weight.dequantize();
+        let mut out = input.matmul(&weight_f32.transpose());
+        
+        if let Some(b) = &self.bias {
+            let bias_f32 = b.dequantize();
+            out = out.add_broadcast(&bias_f32);
+        }
+        out
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        // Return empty for quantized modules since parameters are stored as QuantizedTensor
+        vec![]
     }
 }
 
@@ -80,9 +110,25 @@ impl Module for Sequential {
         self.layers.iter().fold(input.clone(), |x, l| l.forward(&x))
     }
 
-    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
-        // Sequential needs to propagate quantization through all layers
-        self.layers.iter().fold(input.clone(), |x, l| l.forward_quantized(&x, qconfig))
+    fn quantize(&self, qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedSequential {
+            layers: self.layers.iter().map(|l| l.quantize(qconfig)).collect(),
+        })
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        self.layers.iter().flat_map(|l| l.parameters()).collect()
+    }
+}
+
+/// Quantized Sequential layer for inference
+pub struct QuantizedSequential {
+    layers: Vec<Box<dyn QuantizedModule>>,
+}
+
+impl QuantizedModule for QuantizedSequential {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        self.layers.iter().fold(input.clone(), |x, l| l.forward(&x))
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -228,11 +274,15 @@ impl Module for Conv2d {
         }
     }
 
-    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
-        // For now, always use regular forward pass during training
-        // Quantization should only be used during inference after training
-        // TODO: Implement proper quantized inference mode
-        self.forward(input)
+    fn quantize(&self, qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedConv2d {
+            weight: self.weight.quantize(qconfig),
+            bias: self.bias.as_ref().map(|b| b.quantize(qconfig)),
+            stride: self.stride,
+            padding: self.padding,
+            dilation: self.dilation,
+            groups: self.groups,
+        })
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -241,6 +291,72 @@ impl Module for Conv2d {
             params.push(b.clone());
         }
         params
+    }
+}
+
+/// Quantized Conv2d layer for inference
+pub struct QuantizedConv2d {
+    weight: crate::tensor::QuantizedTensor,
+    bias: Option<crate::tensor::QuantizedTensor>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    groups: usize,
+}
+
+impl QuantizedModule for QuantizedConv2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let weight_f32 = self.weight.dequantize();
+        let bias_f32 = self.bias.as_ref().map(|b| b.dequantize());
+        
+        if self.groups == 1 {
+            // Standard convolution
+            input.conv2d(
+                &weight_f32,
+                bias_f32.as_ref(),
+                self.stride,
+                self.padding,
+                self.dilation,
+            )
+        } else {
+            // Grouped convolution - split input and weight, convolve separately, then concatenate
+            let (_n, c_in, _h, _w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            let c_out = weight_f32.shape()[0];
+            let c_in_per_group = c_in / self.groups;
+            let c_out_per_group = c_out / self.groups;
+
+            let mut group_outputs = Vec::new();
+
+            for g in 0..self.groups {
+                // Extract input channels for this group
+                let input_slice = input.slice_channels(g * c_in_per_group, (g + 1) * c_in_per_group);
+
+                // Extract weight channels for this group
+                let weight_slice = weight_f32.slice_output_channels(g * c_out_per_group, (g + 1) * c_out_per_group);
+
+                // Extract bias for this group
+                let bias_slice = bias_f32.as_ref().map(|b| b.slice_1d(g * c_out_per_group, (g + 1) * c_out_per_group));
+
+                // Convolve
+                let group_out = input_slice.conv2d(
+                    &weight_slice,
+                    bias_slice.as_ref(),
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                );
+
+                group_outputs.push(group_out);
+            }
+
+            // Concatenate along channel dimension
+            Tensor::cat(&group_outputs, 1)
+        }
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        // Return empty for quantized modules since parameters are stored as QuantizedTensor
+        vec![]
     }
 }
 
@@ -285,13 +401,6 @@ impl Module for Conv2dReLU {
         )
     }
 
-    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
-        // For now, always use regular forward pass during training
-        // Quantization should only be used during inference after training
-        // TODO: Implement proper quantized inference mode
-        self.forward(input)
-    }
-
     fn parameters(&self) -> Vec<Tensor> {
         self.conv.parameters()
     }
@@ -325,6 +434,31 @@ impl MaxPool2d {
 }
 
 impl Module for MaxPool2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        input.max_pool2d(self.kernel_size, self.stride, self.padding)
+    }
+
+    fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedMaxPool2d {
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+            padding: self.padding,
+        })
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![]
+    }
+}
+
+/// Quantized MaxPool2d layer for inference
+pub struct QuantizedMaxPool2d {
+    kernel_size: (usize, usize),
+    stride: Option<(usize, usize)>,
+    padding: (usize, usize),
+}
+
+impl QuantizedModule for QuantizedMaxPool2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         input.max_pool2d(self.kernel_size, self.stride, self.padding)
     }
@@ -373,6 +507,37 @@ impl Module for AvgPool2d {
         }
     }
 
+    fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedAvgPool2d {
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+            padding: self.padding,
+        })
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![]
+    }
+}
+
+/// Quantized AvgPool2d layer for inference
+pub struct QuantizedAvgPool2d {
+    kernel_size: (usize, usize),
+    stride: Option<(usize, usize)>,
+    padding: (usize, usize),
+}
+
+impl QuantizedModule for QuantizedAvgPool2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        if self.kernel_size == (0, 0) {
+            // Global average pooling
+            let (_n, _c, h, w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            input.avg_pool2d((h, w), Some((1, 1)), (0, 0))
+        } else {
+            input.avg_pool2d(self.kernel_size, self.stride, self.padding)
+        }
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         vec![]
     }
@@ -408,6 +573,36 @@ impl Module for AdaptiveAvgPool2d {
         input.avg_pool2d((kernel_h, kernel_w), Some((stride_h, stride_w)), (0, 0))
     }
 
+    fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedAdaptiveAvgPool2d {
+            output_size: self.output_size,
+        })
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![]
+    }
+}
+
+/// Quantized AdaptiveAvgPool2d layer for inference
+pub struct QuantizedAdaptiveAvgPool2d {
+    output_size: (usize, usize),
+}
+
+impl QuantizedModule for QuantizedAdaptiveAvgPool2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let (_n, _c, h_in, w_in) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+        let (h_out, w_out) = self.output_size;
+
+        // Calculate kernel size and stride to achieve target output size
+        let kernel_h = h_in / h_out;
+        let kernel_w = w_in / w_out;
+        let stride_h = h_in / h_out;
+        let stride_w = w_in / w_out;
+
+        input.avg_pool2d((kernel_h, kernel_w), Some((stride_h, stride_w)), (0, 0))
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         vec![]
     }
@@ -428,6 +623,27 @@ impl Flatten {
 }
 
 impl Module for Flatten {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        input.flatten(self.start_dim)
+    }
+
+    fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedFlatten {
+            start_dim: self.start_dim,
+        })
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![]
+    }
+}
+
+/// Quantized Flatten layer for inference
+pub struct QuantizedFlatten {
+    start_dim: usize,
+}
+
+impl QuantizedModule for QuantizedFlatten {
     fn forward(&self, input: &Tensor) -> Tensor {
         input.flatten(self.start_dim)
     }
