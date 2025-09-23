@@ -8,7 +8,7 @@ use taper::Tape;
 use taper::activation::ReLU;
 use taper::data::mnist::{DataLoader, MNISTDataset};
 use taper::loss::{accuracy, cross_entropy_loss};
-use taper::nn::{Conv2dReLU, MaxPool2d, AdaptiveAvgPool2d, Linear, Module, Sequential, Flatten};
+use taper::nn::{AdaptiveAvgPool2d, Conv2dReLU, Flatten, Linear, MaxPool2d, Module, Sequential};
 use taper::optim::Adam;
 use taper::train::Trainer;
 
@@ -30,58 +30,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build CNN model optimized for MNIST
     println!("Building optimized CNN model...");
-    
+
     // High-performance CNN with fusion operations
     let model = Sequential::new(vec![
         // First conv block with fused conv+relu
         Box::new(Conv2dReLU::new(
-            1, 32, (3, 3),           // 28x28x1 -> 28x28x32
-            Some((1, 1)),            // stride
-            Some((1, 1)),            // padding
-            None, None, true
+            1,
+            32,
+            (3, 3),       // 28x28x1 -> 28x28x32
+            Some((1, 1)), // stride
+            Some((1, 1)), // padding
+            None,
+            None,
+            true,
         )),
         Box::new(Conv2dReLU::new(
-            32, 32, (3, 3),          // 28x28x32 -> 28x28x32
+            32,
+            32,
+            (3, 3), // 28x28x32 -> 28x28x32
             Some((1, 1)),
             Some((1, 1)),
-            None, None, true
+            None,
+            None,
+            true,
         )),
         Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 28x28x32 -> 14x14x32
-
         // Second conv block
         Box::new(Conv2dReLU::new(
-            32, 64, (3, 3),          // 14x14x32 -> 14x14x64
+            32,
+            64,
+            (3, 3), // 14x14x32 -> 14x14x64
             Some((1, 1)),
             Some((1, 1)),
-            None, None, true
+            None,
+            None,
+            true,
         )),
         Box::new(Conv2dReLU::new(
-            64, 64, (3, 3),          // 14x14x64 -> 14x14x64
+            64,
+            64,
+            (3, 3), // 14x14x64 -> 14x14x64
             Some((1, 1)),
             Some((1, 1)),
-            None, None, true
+            None,
+            None,
+            true,
         )),
         Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 14x14x64 -> 7x7x64
-
         // Third conv block
         Box::new(Conv2dReLU::new(
-            64, 128, (3, 3),         // 7x7x64 -> 7x7x128
+            64,
+            128,
+            (3, 3), // 7x7x64 -> 7x7x128
             Some((1, 1)),
             Some((1, 1)),
-            None, None, true
+            None,
+            None,
+            true,
         )),
-
         // Global average pooling instead of flatten to reduce parameters
         Box::new(AdaptiveAvgPool2d::global()), // 7x7x128 -> 1x1x128
         Box::new(Flatten::new(Some(1))),       // 128
-
-
         // Classifier
         Box::new(Linear::new(128, 128, true)),
         Box::new(ReLU),
         Box::new(Linear::new(128, 64, true)),
         Box::new(ReLU),
-        Box::new(Linear::new(64, 10, true)),   // 10 classes
+        Box::new(Linear::new(64, 10, true)), // 10 classes
     ]);
 
     // Count parameters
@@ -90,15 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total parameters: {}", total_params);
 
     // Create optimizer with learning rate scheduling
-    let mut learning_rate = 0.01;  // Much lower starting LR
+    let mut learning_rate = 0.01; // Much lower starting LR
     let optimizer = Adam::new(params, learning_rate, None, None, Some(0.0001));
 
     // Create trainer
-    let mut trainer = Trainer::new(
-        Box::new(model),
-        optimizer,
-        None,
-    );
+    let mut trainer = Trainer::new(Box::new(model), optimizer, None);
 
     // Training settings optimized for fast convergence
     let epochs = 50;
@@ -112,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Training loop with performance monitoring
     let total_start = Instant::now();
-    
+
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
 
@@ -126,7 +137,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Training phase
-        trainer.model.parameters().iter().for_each(|p| p.zero_grad());
+        trainer
+            .model
+            .parameters()
+            .iter()
+            .for_each(|p| p.zero_grad());
 
         let mut train_loss = 0.0;
         let mut train_correct = 0;
@@ -237,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             val_accuracy * 100.0
         );
         println!("   Time: {:.2}s (Val: {}ms)", epoch_time, val_time);
-        
+
         // Performance metrics
         let throughput = train_total as f32 / epoch_time;
         println!("   Throughput: {:.0} samples/sec", throughput);
@@ -255,7 +270,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_time = total_start.elapsed();
     println!("\n{}", "=".repeat(60));
-    println!("Training Complete! Total time: {:.2}s", total_time.as_secs_f32());
+    println!(
+        "Training Complete! Total time: {:.2}s",
+        total_time.as_secs_f32()
+    );
 
     // Final test on some samples
     println!("\nTesting CNN on sample images:");
@@ -276,7 +294,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i + 1,
                 predicted,
                 actual,
-                if predicted == actual { "Correct" } else { "False" }
+                if predicted == actual {
+                    "Correct"
+                } else {
+                    "False"
+                }
             );
         }
     }

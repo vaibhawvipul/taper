@@ -1,6 +1,6 @@
 use crate::{ops, tape::Tape};
 use smallvec::SmallVec;
-use std::{sync::{atomic::Ordering, RwLockReadGuard, RwLockWriteGuard}};
+use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -1006,12 +1006,24 @@ impl Tensor {
         dilation: (usize, usize),
     ) -> Tensor {
         assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C_in, H, W]");
-        assert_eq!(weight.shape.len(), 4, "Weight must be 4D: [C_out, C_in, K_h, K_w]");
+        assert_eq!(
+            weight.shape.len(),
+            4,
+            "Weight must be 4D: [C_out, C_in, K_h, K_w]"
+        );
 
         let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let (c_out, c_in_w, k_h, k_w) = (weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]);
+        let (c_out, c_in_w, k_h, k_w) = (
+            weight.shape[0],
+            weight.shape[1],
+            weight.shape[2],
+            weight.shape[3],
+        );
 
-        assert_eq!(c_in, c_in_w, "Input and weight channel dimensions must match");
+        assert_eq!(
+            c_in, c_in_w,
+            "Input and weight channel dimensions must match"
+        );
 
         let (stride_h, stride_w) = stride;
         let (pad_h, pad_w) = padding;
@@ -1064,14 +1076,14 @@ impl Tensor {
         conv_out.relu_inplace()
     }
 
-    /// 2D Max Pooling
-    /// Input: [N, C, H, W], Output: [N, C, H_out, W_out]
     pub fn max_pool2d(
         &self,
         kernel_size: (usize, usize),
         stride: Option<(usize, usize)>,
         padding: (usize, usize),
     ) -> Tensor {
+        use rayon::prelude::*;
+
         assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C, H, W]");
 
         let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
@@ -1081,106 +1093,114 @@ impl Tensor {
 
         let h_out = (h_in + 2 * pad_h - k_h) / s_h + 1;
         let w_out = (w_in + 2 * pad_w - k_w) / s_w + 1;
+        let out_spatial = h_out * w_out;
 
-        let data = self.data();
-        let mut output_data = vec![f32::NEG_INFINITY; n * c * h_out * w_out];
+        // read-only input slice (hold the guard just to obtain a slice, then drop it)
+        let data_guard = self.data();
+        let x: &[f32] = &data_guard;
 
-        // Efficient pooling with proper indexing
-        for batch in 0..n {
-            for channel in 0..c {
-                for out_h in 0..h_out {
-                    for out_w in 0..w_out {
-                        let mut max_val = f32::NEG_INFINITY;
+        // forward: outputs + argmax (absolute input indices)
+        let mut output_data = vec![f32::NEG_INFINITY; n * c * out_spatial];
+        let mut argmax = vec![0usize; n * c * out_spatial];
 
-                        for k_row in 0..k_h {
-                            for k_col in 0..k_w {
-                                let in_h = out_h * s_h + k_row;
-                                let in_w = out_w * s_w + k_col;
+        // We parallelize across (b,c) chunks, which are disjoint in out/argmax.
+        output_data
+            .par_chunks_mut(out_spatial)
+            .enumerate()
+            .zip(argmax.par_chunks_mut(out_spatial))
+            .for_each(|((bc, out_chunk), arg_chunk)| {
+                let b = bc / c;
+                let ch = bc % c;
 
-                                if in_h >= pad_h && in_w >= pad_w {
-                                    let in_h = in_h - pad_h;
-                                    let in_w = in_w - pad_w;
+                let in_base = b * c * h_in * w_in + ch * h_in * w_in;
 
-                                    if in_h < h_in && in_w < w_in {
-                                        let in_idx = batch * c * h_in * w_in +
-                                                   channel * h_in * w_in +
-                                                   in_h * w_in + in_w;
-                                        max_val = max_val.max(data[in_idx]);
-                                    }
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut best = f32::NEG_INFINITY;
+                        let mut best_idx = in_base; // any valid default
+
+                        // window scan
+                        for kh in 0..k_h {
+                            let ih_pad = oh * s_h + kh;
+                            if ih_pad < pad_h || ih_pad >= h_in + pad_h {
+                                continue;
+                            }
+                            let ih = ih_pad - pad_h;
+
+                            for kw in 0..k_w {
+                                let iw_pad = ow * s_w + kw;
+                                if iw_pad < pad_w || iw_pad >= w_in + pad_w {
+                                    continue;
+                                }
+                                let iw = iw_pad - pad_w;
+
+                                let idx = in_base + ih * w_in + iw;
+                                let v = unsafe { *x.get_unchecked(idx) }; // bounds are checked by our math above
+                                if v > best {
+                                    best = v;
+                                    best_idx = idx;
                                 }
                             }
                         }
 
-                        let out_idx = batch * c * h_out * w_out +
-                                     channel * h_out * w_out +
-                                     out_h * w_out + out_w;
-                        output_data[out_idx] = max_val;
+                        let oidx = oh * w_out + ow;
+                        // these are per-(b,c) chunk slices; no conflicts across threads
+                        out_chunk[oidx] = best;
+                        arg_chunk[oidx] = best_idx;
                     }
                 }
-            }
-        }
+            });
+
+        drop(data_guard); // explicitly drop guard; x stays valid as an immutable slice reference
 
         let mut output = Tensor::new(output_data, &[n, c, h_out, w_out]);
 
         if self.requires_grad {
             output.requires_grad = true;
+
+            // capture what we need; avoid touching input again during backprop
+            let out_clone = output.clone();
             let input = self.clone();
-            let out = output.clone();
-            let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
+            let argmax_capture = argmax; // move into closure
             let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
+                    // allocate gin once
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n * c * h_in * w_in]);
                     }
+                    // safe mutable view
                     let gin = slot.as_mut().unwrap();
-                    let in_data = input.data();
 
-                    // Backpropagate gradients through max pooling
-                    for batch in 0..n {
-                        for channel in 0..c {
-                            for out_h in 0..h_out {
-                                for out_w in 0..w_out {
-                                    let mut max_val = f32::NEG_INFINITY;
-                                    let mut max_pos = (0, 0);
-
-                                    // Find the position of maximum value
-                                    for k_row in 0..k_h {
-                                        for k_col in 0..k_w {
-                                            let in_h = out_h * s_h + k_row;
-                                            let in_w = out_w * s_w + k_col;
-
-                                            if in_h >= pad_h && in_w >= pad_w {
-                                                let in_h = in_h - pad_h;
-                                                let in_w = in_w - pad_w;
-
-                                                if in_h < h_in && in_w < w_in {
-                                                    let in_idx = batch * c * h_in * w_in +
-                                                               channel * h_in * w_in +
-                                                               in_h * w_in + in_w;
-                                                    if in_data[in_idx] > max_val {
-                                                        max_val = in_data[in_idx];
-                                                        max_pos = (in_h, in_w);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Add gradient to the maximum position
-                                    let out_idx = batch * c * h_out * w_out +
-                                                 channel * h_out * w_out +
-                                                 out_h * w_out + out_w;
-                                    let in_idx = batch * c * h_in * w_in +
-                                               channel * h_in * w_in +
-                                               max_pos.0 * w_in + max_pos.1;
-                                    gin[in_idx] += gout[out_idx];
-                                }
+                    // shard gin/gout/argmax by (b,c) — disjoint slices, so no atomics needed
+                    let out_spatial = h_out * w_out;
+                    gin.par_chunks_mut(h_in * w_in)
+                        .enumerate()
+                        .zip(gout.par_chunks(out_spatial))
+                        .zip(argmax_capture.par_chunks(out_spatial))
+                        .for_each(|(((bc, gin_chunk), gout_chunk), arg_chunk)| {
+                            // zero this (b,c) slice before accumulation (since we reuse memory across backprops)
+                            // note: if your engine ensures fresh zeroed grads, you can skip this memset.
+                            for v in gin_chunk.iter_mut() {
+                                *v = 0.0;
                             }
-                        }
-                    }
+
+                            // scatter-add: each output position contributes to its max position
+                            // all writes stay within this gin_chunk; no inter-thread races.
+                            for o in 0..out_spatial {
+                                let in_abs = unsafe { *arg_chunk.get_unchecked(o) };
+                                // convert absolute index to (b,c)-local index
+                                // bc = b*c + c_idx; compute its base to turn absolute->local
+                                let b = bc / c;
+                                let ch = bc % c;
+                                let base = b * c * h_in * w_in + ch * h_in * w_in;
+                                let local = in_abs - base;
+                                debug_assert!(local < gin_chunk.len());
+                                gin_chunk[local] += unsafe { *gout_chunk.get_unchecked(o) };
+                            }
+                        });
                 }
             });
         }
@@ -1195,6 +1215,8 @@ impl Tensor {
         stride: Option<(usize, usize)>,
         padding: (usize, usize),
     ) -> Tensor {
+        use rayon::prelude::*;
+
         assert_eq!(self.shape.len(), 4, "Input must be 4D: [N, C, H, W]");
 
         let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
@@ -1204,102 +1226,126 @@ impl Tensor {
 
         let h_out = (h_in + 2 * pad_h - k_h) / s_h + 1;
         let w_out = (w_in + 2 * pad_w - k_w) / s_w + 1;
+        let out_spatial = h_out * w_out;
 
-        let data = self.data();
-        let mut output_data = vec![0.0; n * c * h_out * w_out];
+        // read-only input slice (drop the lock immediately)
+        let data_guard = self.data();
+        let x: &[f32] = &data_guard;
+
+        let mut output_data = vec![0.0; n * c * out_spatial];
         let pool_size = (k_h * k_w) as f32;
 
-        for batch in 0..n {
-            for channel in 0..c {
-                for out_h in 0..h_out {
-                    for out_w in 0..w_out {
+        // Parallelize across (b,c) chunks: disjoint writes, no atomics needed.
+        output_data
+            .par_chunks_mut(out_spatial)
+            .enumerate()
+            .for_each(|(bc, out_chunk)| {
+                let b = bc / c;
+                let ch = bc % c;
+
+                let in_base = b * c * h_in * w_in + ch * h_in * w_in;
+
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
                         let mut sum = 0.0;
 
-                        for k_row in 0..k_h {
-                            for k_col in 0..k_w {
-                                let in_h = out_h * s_h + k_row;
-                                let in_w = out_w * s_w + k_col;
+                        // window sum with bounds checks hoisted; use unchecked inside
+                        for kh in 0..k_h {
+                            let ih_pad = oh * s_h + kh;
+                            if ih_pad < pad_h || ih_pad >= h_in + pad_h {
+                                continue;
+                            }
+                            let ih = ih_pad - pad_h;
 
-                                if in_h >= pad_h && in_w >= pad_w {
-                                    let in_h = in_h - pad_h;
-                                    let in_w = in_w - pad_w;
-
-                                    if in_h < h_in && in_w < w_in {
-                                        let in_idx = batch * c * h_in * w_in +
-                                                   channel * h_in * w_in +
-                                                   in_h * w_in + in_w;
-                                        sum += data[in_idx];
-                                    }
+                            for kw in 0..k_w {
+                                let iw_pad = ow * s_w + kw;
+                                if iw_pad < pad_w || iw_pad >= w_in + pad_w {
+                                    continue;
                                 }
+                                let iw = iw_pad - pad_w;
+
+                                let idx = in_base + ih * w_in + iw;
+                                // safety: idx computed within bounds by the checks above
+                                sum += unsafe { *x.get_unchecked(idx) };
                             }
                         }
 
-                        let out_idx = batch * c * h_out * w_out +
-                                     channel * h_out * w_out +
-                                     out_h * w_out + out_w;
-                        output_data[out_idx] = sum / pool_size;
+                        out_chunk[oh * w_out + ow] = sum / pool_size;
                     }
                 }
-            }
-        }
+            });
+
+        drop(data_guard); // release read guard
 
         let mut output = Tensor::new(output_data, &[n, c, h_out, w_out]);
 
         if self.requires_grad {
             output.requires_grad = true;
+
+            let out_clone = output.clone();
             let input = self.clone();
-            let out = output.clone();
-            let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
             let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
+            let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
+            let out_spatial = out_spatial;
+            let pool_size = pool_size;
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
+                    // allocate or reuse gin
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; n * c * h_in * w_in]);
                     }
                     let gin = slot.as_mut().unwrap();
-                    let pool_size = (k_h * k_w) as f32;
 
-                    // Distribute gradient equally among pooled elements
-                    for batch in 0..n {
-                        for channel in 0..c {
-                            for out_h in 0..h_out {
-                                for out_w in 0..w_out {
-                                    let out_idx = batch * c * h_out * w_out +
-                                                 channel * h_out * w_out +
-                                                 out_h * w_out + out_w;
-                                    let grad_val = gout[out_idx] / pool_size;
+                    // shard (b,c) disjoint regions; we only add to our slice, so no races.
+                    gin.par_chunks_mut(h_in * w_in)
+                        .enumerate()
+                        .zip(gout.par_chunks(out_spatial))
+                        .for_each(|((bc, gin_chunk), gout_chunk)| {
+                            let _b = bc / c;
+                            let _ch = bc % c;
 
-                                    for k_row in 0..k_h {
-                                        for k_col in 0..k_w {
-                                            let in_h = out_h * s_h + k_row;
-                                            let in_w = out_w * s_w + k_col;
+                            // we accumulate into this chunk only; do NOT zero if engine expects accumulation
+                            // (your code already created zeros on first touch above; subsequent ops add onto it)
 
-                                            if in_h >= pad_h && in_w >= pad_w {
-                                                let in_h = in_h - pad_h;
-                                                let in_w = in_w - pad_w;
+                            for oh in 0..h_out {
+                                for ow in 0..w_out {
+                                    let grad_val =
+                                        unsafe { *gout_chunk.get_unchecked(oh * w_out + ow) }
+                                            / pool_size;
 
-                                                if in_h < h_in && in_w < w_in {
-                                                    let in_idx = batch * c * h_in * w_in +
-                                                               channel * h_in * w_in +
-                                                               in_h * w_in + in_w;
-                                                    gin[in_idx] += grad_val;
-                                                }
+                                    for kh in 0..k_h {
+                                        let ih_pad = oh * s_h + kh;
+                                        if ih_pad < pad_h || ih_pad >= h_in + pad_h {
+                                            continue;
+                                        }
+                                        let ih = ih_pad - pad_h;
+
+                                        for kw in 0..k_w {
+                                            let iw_pad = ow * s_w + kw;
+                                            if iw_pad < pad_w || iw_pad >= w_in + pad_w {
+                                                continue;
+                                            }
+                                            let iw = iw_pad - pad_w;
+
+                                            // local index within this (b,c) gin chunk
+                                            let local = ih * w_in + iw;
+                                            // safety: ih<i_h, iw<w_in
+                                            unsafe {
+                                                *gin_chunk.get_unchecked_mut(local) += grad_val;
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    }
+                        });
                 }
             });
         }
 
         output
     }
-
 
     /// SIMD-optimized im2col transformation
     fn im2col_optimized(
@@ -1326,13 +1372,40 @@ impl Tensor {
 
         // Special case optimizations for common kernel sizes
         if k_h == 3 && k_w == 3 && stride_h == 1 && stride_w == 1 && dil_h == 1 && dil_w == 1 {
-            self.im2col_3x3_stride1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out, pad_h, pad_w);
+            self.im2col_3x3_stride1(
+                &data,
+                &mut col_data,
+                n,
+                c,
+                h_in,
+                w_in,
+                h_out,
+                w_out,
+                pad_h,
+                pad_w,
+            );
         } else if k_h == 1 && k_w == 1 {
             self.im2col_1x1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out);
         } else {
             // General case with SIMD optimization
-            self.im2col_general_simd(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out,
-                                      k_h, k_w, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w);
+            self.im2col_general_simd(
+                &data,
+                &mut col_data,
+                n,
+                c,
+                h_in,
+                w_in,
+                h_out,
+                w_out,
+                k_h,
+                k_w,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dil_h,
+                dil_w,
+            );
         }
 
         Tensor::new(col_data, &[num_windows, col_size])
@@ -1344,9 +1417,14 @@ impl Tensor {
         &self,
         input: &[f32],
         output: &mut [f32],
-        n: usize, c: usize, h_in: usize, w_in: usize,
-        h_out: usize, w_out: usize,
-        pad_h: usize, pad_w: usize,
+        n: usize,
+        c: usize,
+        h_in: usize,
+        w_in: usize,
+        h_out: usize,
+        w_out: usize,
+        pad_h: usize,
+        pad_w: usize,
     ) {
         let col_size = c * 9; // 3x3 = 9
 
@@ -1383,8 +1461,10 @@ impl Tensor {
 
                                         if in_h_valid && in_w >= pad_w && in_w < w_in + pad_w {
                                             let in_w_idx = in_w - pad_w;
-                                            let in_idx = batch_offset + ch * h_in * w_in +
-                                                    in_h_idx * w_in + in_w_idx;
+                                            let in_idx = batch_offset
+                                                + ch * h_in * w_in
+                                                + in_h_idx * w_in
+                                                + in_w_idx;
                                             output[col_idx] = input[in_idx];
                                         }
                                         // else: stays 0.0 (padding)
@@ -1404,8 +1484,12 @@ impl Tensor {
         &self,
         input: &[f32],
         output: &mut [f32],
-        _n: usize, _c: usize, h_in: usize, w_in: usize,
-        h_out: usize, w_out: usize,
+        _n: usize,
+        _c: usize,
+        h_in: usize,
+        w_in: usize,
+        h_out: usize,
+        w_out: usize,
     ) {
         // 1x1 conv is just a reshape - use SIMD memcpy
         assert_eq!(h_in, h_out);
@@ -1422,12 +1506,20 @@ impl Tensor {
         &self,
         input: &[f32],
         output: &mut [f32],
-        n: usize, c: usize, h_in: usize, w_in: usize,
-        h_out: usize, w_out: usize,
-        k_h: usize, k_w: usize,
-        stride_h: usize, stride_w: usize,
-        pad_h: usize, pad_w: usize,
-        dil_h: usize, dil_w: usize,
+        n: usize,
+        c: usize,
+        h_in: usize,
+        w_in: usize,
+        h_out: usize,
+        w_out: usize,
+        k_h: usize,
+        k_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+        dil_h: usize,
+        dil_w: usize,
     ) {
         let col_size = c * k_h * k_w;
 
@@ -1452,27 +1544,41 @@ impl Tensor {
                                 for k_col in 0..k_w {
                                     let in_w = out_w * stride_w + k_col * dil_w;
 
-                                    if in_w >= pad_w && in_w < w_in + pad_w && consecutive_count == k_col - start_k_col {
+                                    if in_w >= pad_w
+                                        && in_w < w_in + pad_w
+                                        && consecutive_count == k_col - start_k_col
+                                    {
                                         consecutive_count += 1;
                                     } else {
                                         // Copy accumulated consecutive elements
                                         if consecutive_count > 0 {
                                             self.copy_consecutive_elements(
-                                                input, output, batch, ch, h_in, w_in,
-                                                in_h_idx, out_w * stride_w + start_k_col * dil_w - pad_w,
-                                                col_base + ch * k_h * k_w + k_row * k_w + start_k_col,
-                                                consecutive_count
+                                                input,
+                                                output,
+                                                batch,
+                                                ch,
+                                                h_in,
+                                                w_in,
+                                                in_h_idx,
+                                                out_w * stride_w + start_k_col * dil_w - pad_w,
+                                                col_base
+                                                    + ch * k_h * k_w
+                                                    + k_row * k_w
+                                                    + start_k_col,
+                                                consecutive_count,
                                             );
                                         }
 
                                         // Handle non-consecutive element
-                                        let col_idx = col_base + ch * k_h * k_w + k_row * k_w + k_col;
+                                        let col_idx =
+                                            col_base + ch * k_h * k_w + k_row * k_w + k_col;
 
                                         if in_w >= pad_w && in_w < w_in + pad_w {
                                             let in_w_idx = in_w - pad_w;
-                                            let in_idx = batch * c * h_in * w_in +
-                                                    ch * h_in * w_in +
-                                                    in_h_idx * w_in + in_w_idx;
+                                            let in_idx = batch * c * h_in * w_in
+                                                + ch * h_in * w_in
+                                                + in_h_idx * w_in
+                                                + in_w_idx;
                                             output[col_idx] = input[in_idx];
                                         }
 
@@ -1484,10 +1590,16 @@ impl Tensor {
                                 // Handle remaining consecutive elements
                                 if consecutive_count > 0 {
                                     self.copy_consecutive_elements(
-                                        input, output, batch, ch, h_in, w_in,
-                                        in_h_idx, out_w * stride_w + start_k_col * dil_w - pad_w,
+                                        input,
+                                        output,
+                                        batch,
+                                        ch,
+                                        h_in,
+                                        w_in,
+                                        in_h_idx,
+                                        out_w * stride_w + start_k_col * dil_w - pad_w,
                                         col_base + ch * k_h * k_w + k_row * k_w + start_k_col,
-                                        consecutive_count
+                                        consecutive_count,
                                     );
                                 }
                             }
@@ -1502,10 +1614,16 @@ impl Tensor {
     #[inline]
     fn copy_consecutive_elements(
         &self,
-        input: &[f32], output: &mut [f32],
-        batch: usize, ch: usize, h_in: usize, w_in: usize,
-        in_h: usize, in_w_start: usize,
-        out_start: usize, count: usize
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        ch: usize,
+        h_in: usize,
+        w_in: usize,
+        in_h: usize,
+        in_w_start: usize,
+        out_start: usize,
+        count: usize,
     ) {
         if count >= 8 && in_w_start + count <= w_in {
             // Use SIMD for larger copies
@@ -1534,7 +1652,7 @@ impl Tensor {
                 std::ptr::copy_nonoverlapping(
                     input.as_ptr().add(in_base),
                     output.as_mut_ptr().add(out_start),
-                    count
+                    count,
                 );
             }
         } else {
@@ -1616,7 +1734,12 @@ impl Tensor {
         assert_eq!(self.shape.len(), 4);
 
         let old_shape = &self.shape;
-        let new_shape = [old_shape[axes[0]], old_shape[axes[1]], old_shape[axes[2]], old_shape[axes[3]]];
+        let new_shape = [
+            old_shape[axes[0]],
+            old_shape[axes[1]],
+            old_shape[axes[2]],
+            old_shape[axes[3]],
+        ];
 
         let data = self.data();
         let mut result_data = vec![0.0; data.len()];
@@ -1634,12 +1757,13 @@ impl Tensor {
                             new_indices[axes[0]],
                             new_indices[axes[1]],
                             new_indices[axes[2]],
-                            new_indices[axes[3]]
+                            new_indices[axes[3]],
                         );
 
-                        let new_idx = n0 * new_shape[1] * new_shape[2] * new_shape[3] +
-                                     n1 * new_shape[2] * new_shape[3] +
-                                     n2 * new_shape[3] + n3;
+                        let new_idx = n0 * new_shape[1] * new_shape[2] * new_shape[3]
+                            + n1 * new_shape[2] * new_shape[3]
+                            + n2 * new_shape[3]
+                            + n3;
 
                         result_data[new_idx] = data[old_idx];
                     }

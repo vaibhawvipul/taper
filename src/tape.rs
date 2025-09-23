@@ -1,5 +1,5 @@
-use std::sync::{Arc, RwLock};
 use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use crate::tensor::Tensor;
 
@@ -69,7 +69,9 @@ impl Tape {
                 id
             };
             // stamp after releasing inner borrow
-            output.tape_node.store(id, std::sync::atomic::Ordering::SeqCst);
+            output
+                .tape_node
+                .store(id, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -92,7 +94,9 @@ impl Tape {
                 });
                 id
             };
-            output.tape_node.store(id, std::sync::atomic::Ordering::SeqCst);
+            output
+                .tape_node
+                .store(id, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
