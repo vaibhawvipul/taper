@@ -1,9 +1,14 @@
-use crate::Tensor;
+use crate::{Tensor, QuantizationConfig};
 use rand::{distributions::{Distribution, Uniform}, Rng};
 
 /// Trait for any differentiable network component.
 pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
+    fn forward_quantized(&self, input: &Tensor, _qconfig: &QuantizationConfig) -> Tensor {
+        // Default implementation: use regular forward pass
+        // Layers with parameters (Linear, Conv2d, etc.) should override this
+        self.forward(input)
+    }
     fn parameters(&self) -> Vec<Tensor>;
 }
 
@@ -43,6 +48,13 @@ impl Module for Linear {
         out
     }
 
+    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
+        // For now, always use regular forward pass during training
+        // Quantization should only be used during inference after training
+        // TODO: Implement proper quantized inference mode
+        self.forward(input)
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         let mut p = vec![self.weight.clone()];
         if let Some(b) = &self.bias {
@@ -66,6 +78,11 @@ impl Sequential {
 impl Module for Sequential {
     fn forward(&self, input: &Tensor) -> Tensor {
         self.layers.iter().fold(input.clone(), |x, l| l.forward(&x))
+    }
+
+    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
+        // Sequential needs to propagate quantization through all layers
+        self.layers.iter().fold(input.clone(), |x, l| l.forward_quantized(&x, qconfig))
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -211,6 +228,13 @@ impl Module for Conv2d {
         }
     }
 
+    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
+        // For now, always use regular forward pass during training
+        // Quantization should only be used during inference after training
+        // TODO: Implement proper quantized inference mode
+        self.forward(input)
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         let mut params = vec![self.weight.clone()];
         if let Some(ref b) = self.bias {
@@ -259,6 +283,13 @@ impl Module for Conv2dReLU {
             self.conv.padding,
             self.conv.dilation,
         )
+    }
+
+    fn forward_quantized(&self, input: &Tensor, qconfig: &QuantizationConfig) -> Tensor {
+        // For now, always use regular forward pass during training
+        // Quantization should only be used during inference after training
+        // TODO: Implement proper quantized inference mode
+        self.forward(input)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
