@@ -1,9 +1,9 @@
-// data/mnist.rs - Robust MNIST dataset loader
-
 use crate::Tensor;
 use std::fs::{File, create_dir_all};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 // Alternative: Use a mirror that might be more reliable
 const MNIST_URLS: &[&str] = &[
@@ -272,23 +272,35 @@ impl MNISTDataset {
         Ok(Tensor::new(labels, &[num_labels]))
     }
 
-    /// Get a batch of samples by indices
+    /// Get a batch of samples by indices (parallelized with Rayon)
     pub fn get_batch(&self, indices: &[usize]) -> (Tensor, Tensor) {
         let batch_size = indices.len();
-        let mut batch_images = Vec::with_capacity(batch_size * 784);
-        let mut batch_labels = Vec::with_capacity(batch_size);
 
-        let images_data = self.images.data();
-        let labels_data = self.labels.data();
+        // preallocate exact sizes
+        let mut batch_images = vec![0.0f32; batch_size * 784];
+        let mut batch_labels = vec![0.0f32; batch_size];
 
-        for &idx in indices {
-            // Copy image
-            for j in 0..784 {
-                batch_images.push(images_data[idx * 784 + j]);
-            }
-            // Copy label
-            batch_labels.push(labels_data[idx]);
-        }
+        // hold read guards once
+        let images_data_guard = self.images.data();
+        let labels_data_guard = self.labels.data();
+        let images_data: &[f32] = &images_data_guard;
+        let labels_data: &[f32] = &labels_data_guard;
+
+        // copy images in parallel: each chunk writes to a disjoint [i*784 .. (i+1)*784)
+        batch_images
+            .par_chunks_mut(784)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let idx = indices[i];
+                let src = &images_data[idx * 784..idx * 784 + 784];
+                // safe: disjoint writes per i
+                dst.copy_from_slice(src);
+            });
+
+        // copy labels in parallel
+        batch_labels.par_iter_mut().enumerate().for_each(|(i, y)| {
+            *y = labels_data[indices[i]];
+        });
 
         (
             Tensor::new(batch_images, &[batch_size, 784]),

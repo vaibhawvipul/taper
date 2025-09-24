@@ -16,6 +16,7 @@ indicatif = "0.17"
 matrixmultiply = "0.3"
 cblas-sys = { version = "0.1", optional = true }
 blas-src   = { version = "0.10", default-features = false, optional = true } # vendor chosen by features below
+rayon = { version = "1.10" }
 
 [features]
 # Default: pure-Rust GEMM (matrixmultiply)

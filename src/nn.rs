@@ -1,5 +1,10 @@
 use crate::{Tensor, QuantizationConfig};
 use rand::{distributions::{Distribution, Uniform}, Rng};
+use crate::Tensor;
+use rand::{
+    Rng,
+    distributions::{Distribution, Uniform},
+};
 
 /// Trait for any differentiable network component.
 pub trait Module {
@@ -162,8 +167,16 @@ impl Conv2d {
         let dilation = dilation.unwrap_or((1, 1));
         let groups = groups.unwrap_or(1);
 
-        assert_eq!(in_channels % groups, 0, "in_channels must be divisible by groups");
-        assert_eq!(out_channels % groups, 0, "out_channels must be divisible by groups");
+        assert_eq!(
+            in_channels % groups,
+            0,
+            "in_channels must be divisible by groups"
+        );
+        assert_eq!(
+            out_channels % groups,
+            0,
+            "out_channels must be divisible by groups"
+        );
 
         let (k_h, k_w) = kernel_size;
 
@@ -240,7 +253,12 @@ impl Module for Conv2d {
             )
         } else {
             // Grouped convolution - split input and weight, convolve separately, then concatenate
-            let (_n, c_in, _h, _w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            let (_n, c_in, _h, _w) = (
+                input.shape()[0],
+                input.shape()[1],
+                input.shape()[2],
+                input.shape()[3],
+            );
             let c_out = self.weight.shape()[0];
             let c_in_per_group = c_in / self.groups;
             let c_out_per_group = c_out / self.groups;
@@ -249,13 +267,19 @@ impl Module for Conv2d {
 
             for g in 0..self.groups {
                 // Extract input channels for this group
-                let input_slice = input.slice_channels(g * c_in_per_group, (g + 1) * c_in_per_group);
+                let input_slice =
+                    input.slice_channels(g * c_in_per_group, (g + 1) * c_in_per_group);
 
                 // Extract weight channels for this group
-                let weight_slice = self.weight.slice_output_channels(g * c_out_per_group, (g + 1) * c_out_per_group);
+                let weight_slice = self
+                    .weight
+                    .slice_output_channels(g * c_out_per_group, (g + 1) * c_out_per_group);
 
                 // Extract bias for this group
-                let bias_slice = self.bias.as_ref().map(|b| b.slice_1d(g * c_out_per_group, (g + 1) * c_out_per_group));
+                let bias_slice = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.slice_1d(g * c_out_per_group, (g + 1) * c_out_per_group));
 
                 // Convolve
                 let group_out = input_slice.conv2d(
@@ -378,7 +402,16 @@ impl Conv2dReLU {
         bias: bool,
     ) -> Self {
         Conv2dReLU {
-            conv: Conv2d::new(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias),
+            conv: Conv2d::new(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+                bias,
+            ),
         }
     }
 
@@ -500,7 +533,12 @@ impl Module for AvgPool2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         if self.kernel_size == (0, 0) {
             // Global average pooling
-            let (_n, _c, h, w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            let (_n, _c, h, w) = (
+                input.shape()[0],
+                input.shape()[1],
+                input.shape()[2],
+                input.shape()[3],
+            );
             input.avg_pool2d((h, w), Some((1, 1)), (0, 0))
         } else {
             input.avg_pool2d(self.kernel_size, self.stride, self.padding)
@@ -561,7 +599,12 @@ impl AdaptiveAvgPool2d {
 
 impl Module for AdaptiveAvgPool2d {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let (_n, _c, h_in, w_in) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+        let (_n, _c, h_in, w_in) = (
+            input.shape()[0],
+            input.shape()[1],
+            input.shape()[2],
+            input.shape()[3],
+        );
         let (h_out, w_out) = self.output_size;
 
         // Calculate kernel size and stride to achieve target output size
@@ -662,7 +705,10 @@ pub struct Dropout {
 
 impl Dropout {
     pub fn new(p: f32) -> Self {
-        assert!(p >= 0.0 && p <= 1.0, "Dropout probability must be between 0 and 1");
+        assert!(
+            p >= 0.0 && p <= 1.0,
+            "Dropout probability must be between 0 and 1"
+        );
         Dropout { p, training: true }
     }
 
@@ -740,7 +786,11 @@ impl Module for BasicBlock {
 impl Tensor {
     /// Extract a slice of channels from a 4D tensor
     pub fn slice_channels(&self, start: usize, end: usize) -> Tensor {
-        assert_eq!(self.shape.len(), 4, "slice_channels only works on 4D tensors");
+        assert_eq!(
+            self.shape.len(),
+            4,
+            "slice_channels only works on 4D tensors"
+        );
         assert!(start < end && end <= self.shape[1], "Invalid channel range");
 
         let (n, _c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
@@ -763,8 +813,15 @@ impl Tensor {
 
     /// Extract output channels from weight tensor
     pub fn slice_output_channels(&self, start: usize, end: usize) -> Tensor {
-        assert_eq!(self.shape.len(), 4, "slice_output_channels only works on 4D weight tensors");
-        assert!(start < end && end <= self.shape[0], "Invalid output channel range");
+        assert_eq!(
+            self.shape.len(),
+            4,
+            "slice_output_channels only works on 4D weight tensors"
+        );
+        assert!(
+            start < end && end <= self.shape[0],
+            "Invalid output channel range"
+        );
 
         let (_c_out, c_in, k_h, k_w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
         let c_out_slice = end - start;
@@ -804,10 +861,17 @@ impl Tensor {
         // Verify all tensors have compatible shapes
         let mut total_dim_size = 0;
         for tensor in tensors {
-            assert_eq!(tensor.shape.len(), ndim, "All tensors must have same number of dimensions");
+            assert_eq!(
+                tensor.shape.len(),
+                ndim,
+                "All tensors must have same number of dimensions"
+            );
             for (i, (&s1, &s2)) in first_shape.iter().zip(tensor.shape.iter()).enumerate() {
                 if i != dim {
-                    assert_eq!(s1, s2, "Tensor shapes must match except in concatenation dimension");
+                    assert_eq!(
+                        s1, s2,
+                        "Tensor shapes must match except in concatenation dimension"
+                    );
                 }
             }
             total_dim_size += tensor.shape[dim];
@@ -847,7 +911,12 @@ impl Tensor {
             4 => {
                 if dim == 1 {
                     // Concatenate along channel dimension (most common for CNNs)
-                    let (n, _, h, w) = (first_shape[0], first_shape[1], first_shape[2], first_shape[3]);
+                    let (n, _, h, w) = (
+                        first_shape[0],
+                        first_shape[1],
+                        first_shape[2],
+                        first_shape[3],
+                    );
 
                     for batch in 0..n {
                         for tensor in tensors {
