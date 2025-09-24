@@ -44,7 +44,7 @@ impl Metrics {
     }
 
     pub fn plot_summary(&self) {
-        println!("\n📊 Training Summary:");
+        println!("\nTraining Summary:");
         println!("{}", "=".repeat(50));
 
         if !self.train_acc.is_empty() {
@@ -199,7 +199,7 @@ impl Trainer {
             let epoch_start = Instant::now();
 
             if verbose {
-                println!("\n📖 Epoch {}/{}", epoch + 1, epochs);
+                println!("\nEpoch {}/{}", epoch + 1, epochs);
             }
 
             // Training phase
@@ -227,7 +227,7 @@ impl Trainer {
             // Print epoch summary
             if verbose {
                 println!(
-                    "\n✅ Epoch {} - Train Loss: {:.4} | Train Acc: {:.2}% | Val Loss: {:.4} | Val Acc: {:.2}% | Time: {:.2}s",
+                    "\nEpoch {} - Train Loss: {:.4} | Train Acc: {:.2}% | Val Loss: {:.4} | Val Acc: {:.2}% | Time: {:.2}s",
                     epoch + 1,
                     train_loss,
                     train_acc * 100.0,
@@ -247,7 +247,7 @@ impl Trainer {
 
             // Early stopping check (optional)
             if val_acc > 0.99 {
-                println!("\n🎉 Reached 99% validation accuracy! Stopping early.");
+                println!("\nReached 99% validation accuracy! Stopping early.");
                 break;
             }
         }
@@ -313,7 +313,7 @@ pub fn quick_train_mnist(
 
 /// Utility function to test model on a few samples
 pub fn test_samples(model: &Box<dyn Module>, dataloader: &mut DataLoader, num_samples: usize) {
-    println!("\n🔍 Testing on {} samples:", num_samples);
+    println!("\nTesting on {} samples:", num_samples);
     println!("{}", "-".repeat(40));
 
     dataloader.reset();
@@ -338,7 +338,7 @@ pub fn test_samples(model: &Box<dyn Module>, dataloader: &mut DataLoader, num_sa
                 i,
                 predicted,
                 actual,
-                if predicted == actual { "✅" } else { "❌" }
+                if predicted == actual { "CORRECT" } else { "WRONG" }
             );
 
             // Optional: Print a mini visualization of the digit
