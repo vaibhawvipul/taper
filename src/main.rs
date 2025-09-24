@@ -11,7 +11,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
-    println!("🧠 XOR Neural Network Training");
+    println!("XOR Neural Network Training");
     println!();
 
     // XOR data

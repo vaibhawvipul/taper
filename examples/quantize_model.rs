@@ -14,7 +14,7 @@ use taper::train::Trainer;
 use taper::{QuantizationConfig, quantization::QuantizationType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Model Quantization Example");
+    println!("Model Quantization Example");
     println!("This example shows how to train a model and then quantize it for inference.\n");
 
     // Load MNIST dataset
@@ -247,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let actual = labels.data()[i] as u8;
         println!("   Sample {}: Predicted={}, Actual={} {}", 
                  i + 1, predicted, actual, 
-                 if predicted == actual { "✓" } else { "✗" });
+                 if predicted == actual { "CORRECT" } else { "WRONG" });
     }
 
     Ok(())
