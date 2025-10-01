@@ -11,7 +11,7 @@ pub mod quantization;
 pub mod data;
 
 pub use gemm::{n, sgemm_rowmajor, t};
-pub use quantization::{QuantizationConfig, QuantizationType};
+pub use quantization::{QuantizationConfig, QuantizationType, QATConfig, QATManager};
 pub use tape::Tape;
 pub use tensor::{Tensor, QuantizedTensor};
 pub use train::{Metrics, Trainer};

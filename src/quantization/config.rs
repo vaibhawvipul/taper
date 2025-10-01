@@ -1,3 +1,8 @@
+//! Quantization configuration and types
+//! 
+//! This module contains the core quantization configuration structures
+//! that define how quantization should be applied to models.
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuantizationConfig {
     pub enabled: bool,  

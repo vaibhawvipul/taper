@@ -1,6 +1,8 @@
 use crate::{ops, tape::Tape, quantization::QuantizationConfig};
 use smallvec::SmallVec;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use rayon::prelude::*;
 
@@ -43,7 +45,7 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
         {
             if is_x86_feature_detected!("sse2") {
-                add_f32_sse(a, b, out);
+                unsafe { add_f32_sse(a, b, out); }
                 return;
             }
         }
@@ -78,10 +80,10 @@ pub mod simd {
         let chunks = a.len() / 4;
         for i in 0..chunks {
             let idx = i * 4;
-            let va = _mm_loadu_ps(a.as_ptr().add(idx));
-            let vb = _mm_loadu_ps(b.as_ptr().add(idx));
+            let va = _mm_loadu_ps(unsafe { a.as_ptr().add(idx) });
+            let vb = _mm_loadu_ps(unsafe { b.as_ptr().add(idx) });
             let result = _mm_add_ps(va, vb);
-            _mm_storeu_ps(out.as_mut_ptr().add(idx), result);
+            _mm_storeu_ps(unsafe { out.as_mut_ptr().add(idx) }, result);
         }
         // Handle remainder
         for i in (chunks * 4)..a.len() {
@@ -126,7 +128,7 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
         {
             if is_x86_feature_detected!("sse") {
-                mul_f32_sse(a, b, out);
+                unsafe { mul_f32_sse(a, b, out); }
                 return;
             }
         }
@@ -160,10 +162,10 @@ pub mod simd {
         let chunks = a.len() / 4;
         for i in 0..chunks {
             let idx = i * 4;
-            let va = _mm_loadu_ps(a.as_ptr().add(idx));
-            let vb = _mm_loadu_ps(b.as_ptr().add(idx));
+            let va = _mm_loadu_ps(unsafe { a.as_ptr().add(idx) });
+            let vb = _mm_loadu_ps(unsafe { b.as_ptr().add(idx) });
             let result = _mm_mul_ps(va, vb);
-            _mm_storeu_ps(out.as_mut_ptr().add(idx), result);
+            _mm_storeu_ps(unsafe { out.as_mut_ptr().add(idx) }, result);
         }
         for i in (chunks * 4)..a.len() {
             out[i] = a[i] * b[i];
@@ -2121,7 +2123,7 @@ impl Tensor {
     }
     
     /// Quantize to int4 (packed representation)
-    fn quantize_to_int4(&self, config: &QuantizationConfig) -> Int4Tensor {
+    fn quantize_to_int4(&self, _config: &QuantizationConfig) -> Int4Tensor {
         // For now, create a dummy int4 tensor
         // TODO: Implement proper int4 quantization with packing
         let size: usize = self.shape.iter().product();
@@ -2152,7 +2154,7 @@ impl Tensor {
     }
     
     /// Quantize to NF4
-    fn quantize_to_nf4(&self, config: &QuantizationConfig) -> NF4Tensor {
+    fn quantize_to_nf4(&self, _config: &QuantizationConfig) -> NF4Tensor {
         // For now, create a dummy NF4 tensor
         // TODO: Implement proper NF4 quantization
         let size: usize = self.shape.iter().product();

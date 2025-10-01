@@ -1,10 +1,5 @@
 use crate::{Tensor, QuantizationConfig};
 use rand::{distributions::{Distribution, Uniform}, Rng};
-use crate::Tensor;
-use rand::{
-    Rng,
-    distributions::{Distribution, Uniform},
-};
 
 /// Trait for any differentiable network component.
 pub trait Module {
@@ -102,6 +97,14 @@ impl QuantizedModule for QuantizedLinear {
 /// A stack of layers applied in sequence.
 pub struct Sequential {
     layers: Vec<Box<dyn Module>>,
+}
+
+impl std::fmt::Debug for Sequential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sequential")
+            .field("layers", &self.layers.len())
+            .finish()
+    }
 }
 
 impl Sequential {
