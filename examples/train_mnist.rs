@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Early stopping if we reach good accuracy
         if val_accuracy > 0.98 {
             println!(
-                "🎉 Reached {:.2}% validation accuracy! Stopping early.",
+                "Reached {:.2}% validation accuracy! Stopping early.",
                 val_accuracy * 100.0
             );
             break;
