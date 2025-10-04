@@ -1,11 +1,11 @@
 //! QAT-aware layer implementations
-//! 
+//!
 //! This module provides QAT-aware wrappers for existing neural network layers,
 //! integrating fake quantization into the forward pass during training.
 
-use crate::{Tensor, nn::Module};
-use super::{FakeQuantize, QATConfig};
 use super::qat_manager::global;
+use super::{FakeQuantize, QATConfig};
+use crate::{Tensor, nn::Module};
 
 /// QAT-aware Linear layer that applies fake quantization during training
 #[derive(Debug)]
@@ -33,7 +33,7 @@ impl QATLinear {
     ) -> Self {
         let inner = crate::nn::Linear::new(in_features, out_features, with_bias);
         let module_id = module_id.unwrap_or_else(|| format!("linear_{}", in_features));
-        
+
         let weight_fake_quant = if qat_config.is_enabled() {
             Some(FakeQuantize::new(
                 qat_config.quant_config.clone(),
@@ -92,7 +92,7 @@ impl Module for QATLinear {
     fn forward(&self, input: &Tensor) -> Tensor {
         // Check if QAT is active
         let qat_active = self.is_qat_enabled() && global::is_training();
-        
+
         if qat_active {
             // Apply fake quantization to weights
             let quantized_weight = if let Some(ref fq) = self.weight_fake_quant {
@@ -123,7 +123,10 @@ impl Module for QATLinear {
         self.inner.parameters()
     }
 
-    fn quantize(&self, qconfig: &crate::quantization::QuantizationConfig) -> Box<dyn crate::nn::QuantizedModule> {
+    fn quantize(
+        &self,
+        qconfig: &crate::quantization::QuantizationConfig,
+    ) -> Box<dyn crate::nn::QuantizedModule> {
         // Delegate to inner layer for actual quantization
         self.inner.quantize(qconfig)
     }
@@ -168,8 +171,9 @@ impl QATConv2d {
             groups,
             bias,
         );
-        let module_id = module_id.unwrap_or_else(|| format!("conv2d_{}_{}", in_channels, out_channels));
-        
+        let module_id =
+            module_id.unwrap_or_else(|| format!("conv2d_{}_{}", in_channels, out_channels));
+
         let weight_fake_quant = if qat_config.is_enabled() {
             Some(FakeQuantize::new(
                 qat_config.quant_config.clone(),
@@ -228,7 +232,7 @@ impl Module for QATConv2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         // Check if QAT is active
         let qat_active = self.is_qat_enabled() && global::is_training();
-        
+
         if qat_active {
             // Apply fake quantization to weights
             let quantized_weight = if let Some(ref fq) = self.weight_fake_quant {
@@ -262,13 +266,17 @@ impl Module for QATConv2d {
         self.inner.parameters()
     }
 
-    fn quantize(&self, qconfig: &crate::quantization::QuantizationConfig) -> Box<dyn crate::nn::QuantizedModule> {
+    fn quantize(
+        &self,
+        qconfig: &crate::quantization::QuantizationConfig,
+    ) -> Box<dyn crate::nn::QuantizedModule> {
         // Delegate to inner layer for actual quantization
         self.inner.quantize(qconfig)
     }
 }
 
 /// QAT-aware Sequential layer that applies fake quantization to all sub-layers
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct QATSequential {
     /// Inner sequential layer
@@ -290,7 +298,7 @@ impl QATSequential {
     ) -> Self {
         let inner = crate::nn::Sequential::new(layers);
         let module_id = module_id.unwrap_or_else(|| "sequential".to_string());
-        
+
         let qat_enabled = qat_config.is_enabled();
         Self {
             inner,
@@ -323,7 +331,10 @@ impl Module for QATSequential {
         self.inner.parameters()
     }
 
-    fn quantize(&self, qconfig: &crate::quantization::QuantizationConfig) -> Box<dyn crate::nn::QuantizedModule> {
+    fn quantize(
+        &self,
+        qconfig: &crate::quantization::QuantizationConfig,
+    ) -> Box<dyn crate::nn::QuantizedModule> {
         self.inner.quantize(qconfig)
     }
 }
@@ -337,7 +348,7 @@ mod tests {
     fn test_qat_linear_creation() {
         let qat_config = QATConfig::int8(0.001, 5);
         let qat_linear = QATLinear::new(784, 128, true, &qat_config, None);
-        
+
         assert!(qat_linear.is_qat_enabled());
         assert_eq!(qat_linear.module_id, "linear_784");
     }
@@ -345,13 +356,13 @@ mod tests {
     #[test]
     fn test_qat_linear_forward() {
         Tape::reset();
-        
+
         let qat_config = QATConfig::int8(0.001, 5);
         let qat_linear = QATLinear::new(784, 128, true, &qat_config, None);
         let input = Tensor::randn(&[32, 784]).requires_grad();
-        
+
         let output = qat_linear.forward(&input);
-        
+
         assert_eq!(output.shape(), &[32, 128]);
         assert!(output.requires_grad);
     }
@@ -360,10 +371,18 @@ mod tests {
     fn test_qat_conv2d_creation() {
         let qat_config = QATConfig::int8(0.001, 5);
         let qat_conv = QATConv2d::new(
-            1, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-            &qat_config, None
+            1,
+            32,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+            &qat_config,
+            None,
         );
-        
+
         assert!(qat_conv.is_qat_enabled());
         assert_eq!(qat_conv.module_id, "conv2d_1_32");
     }
@@ -371,16 +390,24 @@ mod tests {
     #[test]
     fn test_qat_conv2d_forward() {
         Tape::reset();
-        
+
         let qat_config = QATConfig::int8(0.001, 5);
         let qat_conv = QATConv2d::new(
-            1, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-            &qat_config, None
+            1,
+            32,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+            &qat_config,
+            None,
         );
         let input = Tensor::randn(&[1, 1, 28, 28]).requires_grad();
-        
+
         let output = qat_conv.forward(&input);
-        
+
         assert_eq!(output.shape()[0], 1);
         assert_eq!(output.shape()[1], 32);
         assert!(output.requires_grad);
@@ -390,12 +417,12 @@ mod tests {
     fn test_qat_enable_disable() {
         let qat_config = QATConfig::int8(0.001, 5);
         let mut qat_linear = QATLinear::new(784, 128, true, &qat_config, None);
-        
+
         assert!(qat_linear.is_qat_enabled());
-        
+
         qat_linear.enable_qat(false);
         assert!(!qat_linear.is_qat_enabled());
-        
+
         qat_linear.enable_qat(true);
         assert!(qat_linear.is_qat_enabled());
     }

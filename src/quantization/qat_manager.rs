@@ -1,5 +1,5 @@
 //! QAT Manager for managing Quantization-Aware Training modes
-//! 
+//!
 //! This module provides global state management for QAT, allowing
 //! switching between training and evaluation modes across the entire model.
 
@@ -42,7 +42,8 @@ impl QATManager {
 
     /// Check if QAT is globally enabled
     pub fn is_qat_enabled(&self) -> bool {
-        self.global_qat_enabled.read()
+        self.global_qat_enabled
+            .read()
             .map(|state| *state)
             .unwrap_or(false)
     }
@@ -62,7 +63,8 @@ impl QATManager {
         }
 
         // Check module-specific state
-        self.module_states.read()
+        self.module_states
+            .read()
             .map(|states| states.get(module_id).copied().unwrap_or(true))
             .unwrap_or(true) // Default to enabled if not specified
     }
@@ -76,9 +78,7 @@ impl QATManager {
 
     /// Check if in training mode
     pub fn is_training(&self) -> bool {
-        self.training_mode.read()
-            .map(|mode| *mode)
-            .unwrap_or(true)
+        self.training_mode.read().map(|mode| *mode).unwrap_or(true)
     }
 
     /// Check if in evaluation mode
@@ -95,7 +95,8 @@ impl QATManager {
 
     /// Get all module states
     pub fn get_module_states(&self) -> HashMap<String, bool> {
-        self.module_states.read()
+        self.module_states
+            .read()
             .map(|states| states.clone())
             .unwrap_or_default()
     }
@@ -124,7 +125,8 @@ impl QATManager {
             global_enabled: self.is_qat_enabled(),
             training_mode: self.is_training(),
             module_count: self.get_module_states().len(),
-            enabled_modules: self.get_module_states()
+            enabled_modules: self
+                .get_module_states()
                 .values()
                 .filter(|&&enabled| enabled)
                 .count(),
@@ -157,7 +159,6 @@ impl QATStatus {
     }
 }
 
-/// Global QAT manager instance
 lazy_static::lazy_static! {
     static ref GLOBAL_QAT_MANAGER: QATManager = QATManager::new();
 }
@@ -231,10 +232,10 @@ mod tests {
     #[test]
     fn test_qat_manager_enable_disable() {
         let manager = QATManager::new();
-        
+
         manager.enable_qat(true);
         assert!(manager.is_qat_enabled());
-        
+
         manager.enable_qat(false);
         assert!(!manager.is_qat_enabled());
     }
@@ -242,11 +243,11 @@ mod tests {
     #[test]
     fn test_module_states() {
         let manager = QATManager::new();
-        
+
         manager.enable_qat(true);
         manager.set_module_qat("linear1", true);
         manager.set_module_qat("linear2", false);
-        
+
         assert!(manager.is_module_qat_enabled("linear1"));
         assert!(!manager.is_module_qat_enabled("linear2"));
         assert!(manager.is_module_qat_enabled("linear3")); // Default to enabled
@@ -255,11 +256,11 @@ mod tests {
     #[test]
     fn test_training_mode() {
         let manager = QATManager::new();
-        
+
         manager.set_training_mode(false);
         assert!(!manager.is_training());
         assert!(manager.is_eval());
-        
+
         manager.set_training_mode(true);
         assert!(manager.is_training());
         assert!(!manager.is_eval());
@@ -268,11 +269,11 @@ mod tests {
     #[test]
     fn test_qat_status() {
         let manager = QATManager::new();
-        
+
         manager.enable_qat(true);
         manager.set_module_qat("linear1", true);
         manager.set_module_qat("linear2", false);
-        
+
         let status = manager.get_status();
         assert!(status.global_enabled);
         assert!(status.training_mode);
@@ -285,11 +286,11 @@ mod tests {
     fn test_global_functions() {
         global::enable_qat();
         assert!(global::is_qat_enabled());
-        
+
         global::set_training_mode(false);
         assert!(!global::is_training());
         assert!(global::is_eval());
-        
+
         global::disable_qat();
         assert!(!global::is_qat_enabled());
     }

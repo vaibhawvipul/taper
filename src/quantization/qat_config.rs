@@ -1,5 +1,5 @@
 //! Quantization-Aware Training (QAT) configuration
-//! 
+//!
 //! This module provides configuration structures specifically for QAT,
 //! extending the base quantization configuration with QAT-specific parameters.
 
@@ -64,7 +64,11 @@ impl QATConfig {
 
     /// Create QAT config for Float16 quantization
     pub fn float16(learning_rate: f32, warmup_epochs: usize) -> Self {
-        Self::new(QuantizationConfig::float16(true), learning_rate, warmup_epochs)
+        Self::new(
+            QuantizationConfig::float16(true),
+            learning_rate,
+            warmup_epochs,
+        )
     }
 
     /// Enable per-channel quantization
@@ -148,7 +152,7 @@ mod tests {
     #[test]
     fn test_warmup_phase() {
         let config = QATConfig::int8(0.001, 5);
-        
+
         assert!(config.is_warmup(0));
         assert!(config.is_warmup(4));
         assert!(!config.is_warmup(5));
@@ -158,11 +162,11 @@ mod tests {
     #[test]
     fn test_effective_learning_rate() {
         let config = QATConfig::int8(0.001, 5);
-        
+
         // During warmup, should be reduced
         assert_eq!(config.get_effective_lr(0), 0.0001);
         assert_eq!(config.get_effective_lr(4), 0.0001);
-        
+
         // After warmup, should be full rate
         assert_eq!(config.get_effective_lr(5), 0.001);
         assert_eq!(config.get_effective_lr(10), 0.001);

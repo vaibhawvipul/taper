@@ -338,7 +338,11 @@ pub fn test_samples(model: &Box<dyn Module>, dataloader: &mut DataLoader, num_sa
                 i,
                 predicted,
                 actual,
-                if predicted == actual { "CORRECT" } else { "WRONG" }
+                if predicted == actual {
+                    "CORRECT"
+                } else {
+                    "WRONG"
+                }
             );
 
             // Optional: Print a mini visualization of the digit

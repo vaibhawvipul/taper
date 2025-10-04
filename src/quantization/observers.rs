@@ -1,5 +1,5 @@
 //! Quantization observers for collecting statistics during QAT
-//! 
+//!
 //! This module provides observers that collect statistics about tensor values
 //! during training, which are used to determine optimal quantization parameters.
 
@@ -53,7 +53,7 @@ impl MinMaxObserver {
         }
 
         let data = tensor.data();
-        
+
         if self.min_values.is_empty() {
             // Initialize with first observation
             self.min_values = data.iter().copied().collect();
@@ -67,7 +67,7 @@ impl MinMaxObserver {
                 }
             }
         }
-        
+
         self.num_observations += 1;
     }
 
@@ -83,12 +83,18 @@ impl MinMaxObserver {
 
     /// Get the global minimum value
     pub fn global_min(&self) -> f32 {
-        self.min_values.iter().copied().fold(f32::INFINITY, f32::min)
+        self.min_values
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
     }
 
     /// Get the global maximum value
     pub fn global_max(&self) -> f32 {
-        self.max_values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        self.max_values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// Get the number of observations
@@ -158,15 +164,15 @@ impl HistogramObserver {
         }
 
         let data = tensor.data();
-        
+
         if self.bin_edges.is_empty() {
             // Initialize bin edges based on first observation
             let min_val = data.iter().copied().fold(f32::INFINITY, f32::min);
             let max_val = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            
+
             let range = max_val - min_val;
             let bin_width = range / self.num_bins as f32;
-            
+
             self.bin_edges = (0..=self.num_bins)
                 .map(|i| min_val + i as f32 * bin_width)
                 .collect();
@@ -180,7 +186,7 @@ impl HistogramObserver {
                 }
             }
         }
-        
+
         self.num_observations += 1;
     }
 
@@ -220,9 +226,12 @@ impl HistogramObserver {
     pub fn get_stats(&self) -> HistogramStats {
         let total_count: usize = self.bins.iter().sum();
         let mean_bin = if total_count > 0 {
-            self.bins.iter().enumerate()
+            self.bins
+                .iter()
+                .enumerate()
                 .map(|(i, &count)| i * count)
-                .sum::<usize>() as f32 / total_count as f32
+                .sum::<usize>() as f32
+                / total_count as f32
         } else {
             0.0
         };
@@ -280,12 +289,14 @@ impl ObserverManager {
 
     /// Add a MinMax observer
     pub fn add_minmax_observer(&mut self, name: &str) {
-        self.minmax_observers.insert(name.to_string(), MinMaxObserver::new());
+        self.minmax_observers
+            .insert(name.to_string(), MinMaxObserver::new());
     }
 
     /// Add a histogram observer
     pub fn add_histogram_observer(&mut self, name: &str, num_bins: usize) {
-        self.histogram_observers.insert(name.to_string(), HistogramObserver::new(num_bins));
+        self.histogram_observers
+            .insert(name.to_string(), HistogramObserver::new(num_bins));
     }
 
     /// Observe a tensor with a MinMax observer
@@ -309,7 +320,9 @@ impl ObserverManager {
 
     /// Get histogram observer statistics
     pub fn get_histogram_stats(&self, name: &str) -> Option<HistogramStats> {
-        self.histogram_observers.get(name).map(|obs| obs.get_stats())
+        self.histogram_observers
+            .get(name)
+            .map(|obs| obs.get_stats())
     }
 
     /// Reset all observers
@@ -339,9 +352,9 @@ mod tests {
     fn test_minmax_observer() {
         let mut observer = MinMaxObserver::new();
         let tensor = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        
+
         observer.observe(&tensor);
-        
+
         assert_eq!(observer.num_observations(), 1);
         assert_eq!(observer.global_min(), 1.0);
         assert_eq!(observer.global_max(), 4.0);
@@ -351,9 +364,9 @@ mod tests {
     fn test_histogram_observer() {
         let mut observer = HistogramObserver::new(10);
         let tensor = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        
+
         observer.observe(&tensor);
-        
+
         assert_eq!(observer.num_observations(), 1);
         assert_eq!(observer.bins().len(), 10);
     }
@@ -362,10 +375,10 @@ mod tests {
     fn test_observer_manager() {
         let mut manager = ObserverManager::new();
         manager.add_minmax_observer("test");
-        
+
         let tensor = Tensor::new(vec![1.0, 2.0, 3.0], &[3]);
         manager.observe_minmax("test", &tensor);
-        
+
         let stats = manager.get_minmax_stats("test").unwrap();
         assert_eq!(stats.num_observations, 1);
         assert_eq!(stats.global_min, 1.0);

@@ -1,43 +1,43 @@
 //! Quantization configuration and types
-//! 
+//!
 //! This module contains the core quantization configuration structures
 //! that define how quantization should be applied to models.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuantizationConfig {
-    pub enabled: bool,  
+    pub enabled: bool,
     pub quant_type: QuantizationType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuantizationType {
-    Int4, 
-    Int8, 
-    Float16, 
-    BFloat16, 
+    Int4,
+    Int8,
+    Float16,
+    BFloat16,
     NF4,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuantizationSchema {
-    Uniform, 
-    PerChannel, 
+    Uniform,
+    PerChannel,
 }
 
-impl Default for QuantizationConfig { 
+impl Default for QuantizationConfig {
     fn default() -> Self {
         Self {
-            enabled: false, 
+            enabled: false,
             quant_type: QuantizationType::Int8,
         }
     }
 }
 
 impl QuantizationConfig {
-    // new quantization config 
+    // new quantization config
     pub fn new(enabled: bool, quant_type: QuantizationType) -> Self {
         Self {
-            enabled, 
+            enabled,
             quant_type,
         }
     }
@@ -66,9 +66,9 @@ impl QuantizationConfig {
         self.enabled
     }
 
-    // updated compute range for multiple types. 
+    // updated compute range for multiple types.
     pub fn compute_range(&self) -> Option<(i32, i32)> {
-        match self.quant_type { 
+        match self.quant_type {
             QuantizationType::Int8 => Some((-128, 127)),
             QuantizationType::Int4 => Some((-8, 7)),
             QuantizationType::Float16 => None, // Float types don't have discrete ranges
@@ -79,26 +79,32 @@ impl QuantizationConfig {
 
     pub fn bit_width(&self) -> u8 {
         match self.quant_type {
-            QuantizationType::Int8 => 8, 
-            QuantizationType::Int4 => 4, 
-            QuantizationType::Float16 => 16, 
-            QuantizationType::BFloat16 => 16, 
-            QuantizationType::NF4 => 4, 
+            QuantizationType::Int8 => 8,
+            QuantizationType::Int4 => 4,
+            QuantizationType::Float16 => 16,
+            QuantizationType::BFloat16 => 16,
+            QuantizationType::NF4 => 4,
         }
     }
 
     pub fn is_integer(&self) -> bool {
-        matches!(self.quant_type, QuantizationType::Int8 | QuantizationType::Int4 | QuantizationType::NF4)
+        matches!(
+            self.quant_type,
+            QuantizationType::Int8 | QuantizationType::Int4 | QuantizationType::NF4
+        )
     }
 
     pub fn is_float(&self) -> bool {
-        matches!(self.quant_type, QuantizationType::BFloat16 | QuantizationType::Float16)
+        matches!(
+            self.quant_type,
+            QuantizationType::BFloat16 | QuantizationType::Float16
+        )
     }
 
     // per-channel quantization (using Int8 as default)
     pub fn per_channel(enabled: bool) -> Self {
         Self {
-            enabled, 
+            enabled,
             quant_type: QuantizationType::Int8, // Default to Int8 for per-channel
         }
     }

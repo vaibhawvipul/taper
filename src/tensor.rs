@@ -1,8 +1,8 @@
-use crate::{ops, tape::Tape, quantization::QuantizationConfig};
+use crate::{ops, quantization::QuantizationConfig, tape::Tape};
 use smallvec::SmallVec;
-use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
 use rayon::prelude::*;
 
@@ -45,7 +45,9 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
         {
             if is_x86_feature_detected!("sse2") {
-                unsafe { add_f32_sse(a, b, out); }
+                unsafe {
+                    add_f32_sse(a, b, out);
+                }
                 return;
             }
         }
@@ -128,7 +130,9 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
         {
             if is_x86_feature_detected!("sse") {
-                unsafe { mul_f32_sse(a, b, out); }
+                unsafe {
+                    mul_f32_sse(a, b, out);
+                }
                 return;
             }
         }
@@ -265,6 +269,7 @@ pub struct Int8Tensor {
 
 /// Int4 quantized tensor (packed representation - 2 values per byte)
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Int4Tensor {
     data: Rc<RefCell<Vec<u8>>>, // Packed: 2 int4 values per u8
     shape: SmallVec<[usize; 4]>,
@@ -287,6 +292,7 @@ pub struct BFloat16Tensor {
 }
 
 /// NF4 quantized tensor
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct NF4Tensor {
     data: Rc<RefCell<Vec<u8>>>, // Packed NF4 values
@@ -319,7 +325,7 @@ impl QuantizedTensor {
             QuantizedTensor::NF4(tensor) => tensor.dequantize(),
         }
     }
-    
+
     /// Get the shape
     pub fn shape(&self) -> &[usize] {
         match self {
@@ -341,25 +347,25 @@ impl Int8Tensor {
             zero_point,
         }
     }
-    
+
     pub fn dequantize(&self) -> Tensor {
         let data = self.data();
         let f32_data: Vec<f32> = data
             .iter()
             .map(|&q| (q as f32 - self.zero_point as f32) * self.scale)
             .collect();
-        
+
         Tensor::new(f32_data, &self.shape)
     }
-    
+
     pub fn data(&self) -> std::cell::Ref<'_, Vec<i8>> {
         self.data.borrow()
     }
-    
+
     pub fn scale(&self) -> f32 {
         self.scale
     }
-    
+
     pub fn zero_point(&self) -> i32 {
         self.zero_point
     }
@@ -374,14 +380,14 @@ impl Int4Tensor {
             zero_point,
         }
     }
-    
+
     pub fn dequantize(&self) -> Tensor {
         // TODO: Implement int4 unpacking and dequantization
         // For now, return a dummy tensor
         let size: usize = self.shape.iter().product();
         Tensor::new(vec![0.0; size], &self.shape)
     }
-    
+
     pub fn data(&self) -> std::cell::Ref<'_, Vec<u8>> {
         self.data.borrow()
     }
@@ -394,23 +400,23 @@ impl Float16Tensor {
             shape,
         }
     }
-    
+
     /// Create a float16 tensor from an f32 tensor (for non-quantized case)
     pub fn from_f32_tensor(tensor: &Tensor) -> Self {
         // For non-quantized case, just store as dummy float16
         let size: usize = tensor.shape.iter().product();
         let dummy_data = vec![0u16; size];
-        
+
         Self::new(dummy_data, tensor.shape.clone())
     }
-    
+
     pub fn dequantize(&self) -> Tensor {
         // TODO: Implement float16 to f32 conversion
         // For now, return a dummy tensor
         let size: usize = self.shape.iter().product();
         Tensor::new(vec![0.0; size], &self.shape)
     }
-    
+
     pub fn data(&self) -> std::cell::Ref<'_, Vec<u16>> {
         self.data.borrow()
     }
@@ -423,14 +429,14 @@ impl BFloat16Tensor {
             shape,
         }
     }
-    
+
     pub fn dequantize(&self) -> Tensor {
         // TODO: Implement bfloat16 to f32 conversion
         // For now, return a dummy tensor
         let size: usize = self.shape.iter().product();
         Tensor::new(vec![0.0; size], &self.shape)
     }
-    
+
     pub fn data(&self) -> std::cell::Ref<'_, Vec<u16>> {
         self.data.borrow()
     }
@@ -445,14 +451,14 @@ impl NF4Tensor {
             zero_point,
         }
     }
-    
+
     pub fn dequantize(&self) -> Tensor {
         // TODO: Implement NF4 unpacking and dequantization
         // For now, return a dummy tensor
         let size: usize = self.shape.iter().product();
         Tensor::new(vec![0.0; size], &self.shape)
     }
-    
+
     pub fn data(&self) -> std::cell::Ref<'_, Vec<u8>> {
         self.data.borrow()
     }
@@ -2078,7 +2084,7 @@ impl Tensor {
             // If quantization is disabled, return a "fake" quantized tensor
             return QuantizedTensor::Float16(Float16Tensor::from_f32_tensor(self));
         }
-        
+
         match config.quant_type {
             crate::quantization::QuantizationType::Int8 => {
                 QuantizedTensor::Int8(self.quantize_to_int8(config))
@@ -2097,19 +2103,19 @@ impl Tensor {
             }
         }
     }
-    
+
     /// Quantize to int8
     fn quantize_to_int8(&self, config: &QuantizationConfig) -> Int8Tensor {
         let data = self.data();
         let (qmin, qmax) = config.compute_range().unwrap();
-        
+
         // Calculate min/max and scale/zero_point
         let min_val = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
         let max_val = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
+
         let scale = config.compute_scale(min_val, max_val).unwrap();
         let zero_point = config.compute_zero_point(min_val, scale).unwrap();
-        
+
         // Quantize
         let quantized_data: Vec<i8> = data
             .iter()
@@ -2118,10 +2124,10 @@ impl Tensor {
                 q.clamp(qmin, qmax) as i8
             })
             .collect();
-        
+
         Int8Tensor::new(quantized_data, self.shape.clone(), scale, zero_point)
     }
-    
+
     /// Quantize to int4 (packed representation)
     fn quantize_to_int4(&self, _config: &QuantizationConfig) -> Int4Tensor {
         // For now, create a dummy int4 tensor
@@ -2129,30 +2135,30 @@ impl Tensor {
         let size: usize = self.shape.iter().product();
         let packed_size = (size + 1) / 2; // 2 int4 values per byte
         let dummy_data = vec![0u8; packed_size];
-        
+
         Int4Tensor::new(dummy_data, self.shape.clone(), 1.0, 0)
     }
-    
+
     /// Convert to float16
     fn quantize_to_float16(&self) -> Float16Tensor {
         // For now, create a dummy float16 tensor
         // TODO: Implement proper float16 conversion
         let size: usize = self.shape.iter().product();
         let dummy_data = vec![0u16; size];
-        
+
         Float16Tensor::new(dummy_data, self.shape.clone())
     }
-    
+
     /// Convert to bfloat16
     fn quantize_to_bfloat16(&self) -> BFloat16Tensor {
         // For now, create a dummy bfloat16 tensor
         // TODO: Implement proper bfloat16 conversion
         let size: usize = self.shape.iter().product();
         let dummy_data = vec![0u16; size];
-        
+
         BFloat16Tensor::new(dummy_data, self.shape.clone())
     }
-    
+
     /// Quantize to NF4
     fn quantize_to_nf4(&self, _config: &QuantizationConfig) -> NF4Tensor {
         // For now, create a dummy NF4 tensor
@@ -2160,7 +2166,7 @@ impl Tensor {
         let size: usize = self.shape.iter().product();
         let packed_size = (size + 1) / 2; // 2 NF4 values per byte
         let dummy_data = vec![0u8; packed_size];
-        
+
         NF4Tensor::new(dummy_data, self.shape.clone(), 1.0, 0)
     }
 }

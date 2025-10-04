@@ -1,28 +1,27 @@
 //! Quantization module for Taper deep learning library
-//! 
-//! This module provides both Post-Training Quantization (PTQ) and 
+//!
+//! This module provides both Post-Training Quantization (PTQ) and
 //! Quantization-Aware Training (QAT) capabilities.
 
 pub mod config;
-pub mod qat_config;
 pub mod fake_quantize;
-pub mod qat_manager;
-pub mod qat_layers;
 pub mod observers;
+pub mod qat_config;
+pub mod qat_layers;
+pub mod qat_manager;
 
 // Re-export main types for backward compatibility
-pub use config::{QuantizationConfig, QuantizationType, QuantizationSchema};
-pub use qat_config::QATConfig;
+pub use config::{QuantizationConfig, QuantizationSchema, QuantizationType};
 pub use fake_quantize::FakeQuantize;
+pub use qat_config::QATConfig;
 pub use qat_manager::QATManager;
 
 // Re-export QAT layers
-pub use qat_layers::{QATLinear, QATConv2d, QATSequential};
+pub use qat_layers::{QATConv2d, QATLinear, QATSequential};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tensor;
 
     #[test]
     fn test_quantization_config_creation() {

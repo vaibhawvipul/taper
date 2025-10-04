@@ -1,11 +1,11 @@
 //! Fake quantization implementation for Quantization-Aware Training
-//! 
+//!
 //! This module provides fake quantization operations that simulate quantization
 //! effects during training while maintaining differentiability through the
 //! Straight-Through Estimator (STE).
 
-use crate::Tensor;
 use super::config::{QuantizationConfig, QuantizationType};
+use crate::Tensor;
 
 /// Fake quantization module that simulates quantization during training
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ impl FakeQuantize {
     /// Create a new fake quantization module
     pub fn new(quant_config: QuantizationConfig, symmetric: bool) -> Self {
         let (qmin, qmax) = quant_config.compute_range().unwrap_or((-128, 127));
-        
+
         Self {
             quant_config,
             scale: 1.0,
@@ -73,14 +73,20 @@ impl FakeQuantize {
         }
 
         let (min_val, max_val) = self.compute_min_max(data);
-        
+
         if self.symmetric {
             let max_abs = min_val.abs().max(max_val.abs());
             self.scale = max_abs / (self.qmax as f32);
             self.zero_point = 0;
         } else {
-            self.scale = self.quant_config.compute_scale(min_val, max_val).unwrap_or(1.0);
-            self.zero_point = self.quant_config.compute_zero_point(min_val, self.scale).unwrap_or(0);
+            self.scale = self
+                .quant_config
+                .compute_scale(min_val, max_val)
+                .unwrap_or(1.0);
+            self.zero_point = self
+                .quant_config
+                .compute_zero_point(min_val, self.scale)
+                .unwrap_or(0);
         }
     }
 
@@ -127,13 +133,13 @@ impl FakeQuantize {
         }
 
         let mut output = Tensor::new(result, input.shape());
-        
+
         // Set up gradient computation with straight-through estimator
         if input.requires_grad {
             output.requires_grad = true;
             let input_clone = input.clone();
             let output_clone = output.clone();
-            
+
             // Use straight-through estimator: forward quantizes, backward passes through
             crate::tape::Tape::push_unary_op(input, &output, move || {
                 if let Some(grad_output) = output_clone.grad_ref() {
@@ -143,7 +149,7 @@ impl FakeQuantize {
                         *slot = Some(vec![0.0; grad_output.len()]);
                     }
                     let grad_input = slot.as_mut().unwrap();
-                    
+
                     for (gi, &go) in grad_input.iter_mut().zip(grad_output.iter()) {
                         *gi += go;
                     }
@@ -160,7 +166,7 @@ impl FakeQuantize {
             // Quantize: q = round((x - zero_point) / scale)
             let q = ((val / self.scale) + self.zero_point as f32).round() as i32;
             let q_clamped = q.clamp(self.qmin, self.qmax);
-            
+
             // Dequantize: x' = (q - zero_point) * scale
             output[i] = (q_clamped - self.zero_point) as f32 * self.scale;
         }
@@ -192,17 +198,17 @@ impl FakeQuantize {
         if val == 0.0 || !val.is_finite() {
             return val;
         }
-        
+
         // Simulate reduced precision by rounding to fewer significant digits
         let magnitude = val.abs();
         if magnitude < 1e-8 {
             return 0.0;
         }
-        
+
         let _exp = magnitude.log2().floor();
         let mantissa_bits = 10; // Float16 has 10 mantissa bits
         let scale = 2_f32.powi(mantissa_bits as i32);
-        
+
         (val * scale).round() / scale
     }
 
@@ -212,17 +218,17 @@ impl FakeQuantize {
         if val == 0.0 || !val.is_finite() {
             return val;
         }
-        
+
         // BFloat16 has 7 mantissa bits (vs 10 for Float16)
         let magnitude = val.abs();
         if magnitude < 1e-8 {
             return 0.0;
         }
-        
+
         let _exp = magnitude.log2().floor();
         let mantissa_bits = 7; // BFloat16 has 7 mantissa bits
         let scale = 2_f32.powi(mantissa_bits as i32);
-        
+
         (val * scale).round() / scale
     }
 
@@ -258,7 +264,7 @@ mod tests {
         let fq = FakeQuantize::int8(true);
         let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let output = fq.forward(&input);
-        
+
         assert_eq!(output.shape(), input.shape());
         // Output should be quantized (different from input)
         assert_ne!(output.data()[0], input.data()[0]);
@@ -268,11 +274,11 @@ mod tests {
     fn test_fake_quantize_training_mode() {
         let mut fq = FakeQuantize::int8(true);
         let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        
+
         // In training mode, should quantize
         let output_train = fq.forward(&input);
         assert_ne!(output_train.data()[0], input.data()[0]);
-        
+
         // In eval mode, should pass through
         fq.set_training(false);
         let output_eval = fq.forward(&input);
@@ -283,9 +289,9 @@ mod tests {
     fn test_update_params() {
         let mut fq = FakeQuantize::int8(true);
         let data = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
-        
+
         fq.update_params(&data);
-        
+
         // Scale and zero point should be updated
         assert!(fq.scale() > 0.0);
         assert!(fq.zero_point() >= fq.qmin);

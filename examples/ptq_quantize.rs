@@ -4,14 +4,14 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use std::time::Instant;
+use taper::QuantizationConfig;
 use taper::Tape;
 use taper::activation::ReLU;
 use taper::data::mnist::{DataLoader, MNISTDataset};
 use taper::loss::{accuracy, cross_entropy_loss};
-use taper::nn::{Conv2dReLU, MaxPool2d, AdaptiveAvgPool2d, Linear, Module, Sequential, Flatten, QuantizedModule};
+use taper::nn::{AdaptiveAvgPool2d, Conv2dReLU, Flatten, Linear, MaxPool2d, Module, Sequential};
 use taper::optim::Adam;
 use taper::train::Trainer;
-use taper::{QuantizationConfig, quantization::QuantizationType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model Quantization Example");
@@ -33,28 +33,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Building CNN model...");
     let model = Sequential::new(vec![
         // First conv block
-        Box::new(Conv2dReLU::new(1, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true)),
-        Box::new(Conv2dReLU::new(32, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true)),
+        Box::new(Conv2dReLU::new(
+            1,
+            32,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+        )),
+        Box::new(Conv2dReLU::new(
+            32,
+            32,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+        )),
         Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 28x28 -> 14x14
-
         // Second conv block
-        Box::new(Conv2dReLU::new(32, 64, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true)),
-        Box::new(Conv2dReLU::new(64, 64, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true)),
+        Box::new(Conv2dReLU::new(
+            32,
+            64,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+        )),
+        Box::new(Conv2dReLU::new(
+            64,
+            64,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+        )),
         Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 14x14 -> 7x7
-
         // Third conv block
-        Box::new(Conv2dReLU::new(64, 128, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true)),
-
+        Box::new(Conv2dReLU::new(
+            64,
+            128,
+            (3, 3),
+            Some((1, 1)),
+            Some((1, 1)),
+            None,
+            None,
+            true,
+        )),
         // Global average pooling
         Box::new(AdaptiveAvgPool2d::global()), // 7x7x128 -> 1x1x128
         Box::new(Flatten::new(Some(1))),       // 128
-
         // Classifier
         Box::new(Linear::new(128, 128, true)),
         Box::new(ReLU),
         Box::new(Linear::new(128, 64, true)),
         Box::new(ReLU),
-        Box::new(Linear::new(64, 10, true)),   // 10 classes
+        Box::new(Linear::new(64, 10, true)), // 10 classes
     ]);
 
     // Count parameters
@@ -66,11 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let optimizer = Adam::new(params, 0.01, None, None, Some(0.0001));
 
     // Create trainer
-    let mut trainer = Trainer::new(
-        Box::new(model),
-        optimizer,
-        None,
-    );
+    let mut trainer = Trainer::new(Box::new(model), optimizer, None);
 
     println!("\n{}\n", "=".repeat(60));
     println!("Step 1: Training the model (2 epochs)...");
@@ -82,7 +119,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Epoch {}/2", epoch);
 
         // Training phase
-        trainer.model.parameters().iter().for_each(|p| p.zero_grad());
+        trainer
+            .model
+            .parameters()
+            .iter()
+            .for_each(|p| p.zero_grad());
 
         let mut train_loss = 0.0;
         let mut train_correct = 0;
@@ -187,13 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quantize_start = Instant::now();
     let quantized_model_int8 = trainer.model.quantize(&int8_config);
     let quantize_time = quantize_start.elapsed();
-    println!("Int8 quantization completed in {:.2}ms", quantize_time.as_millis());
+    println!(
+        "Int8 quantization completed in {:.2}ms",
+        quantize_time.as_millis()
+    );
 
     println!("Quantizing model to Float16...");
     let quantize_start = Instant::now();
     let quantized_model_f16 = trainer.model.quantize(&float16_config);
     let quantize_time = quantize_start.elapsed();
-    println!("Float16 quantization completed in {:.2}ms", quantize_time.as_millis());
+    println!(
+        "Float16 quantization completed in {:.2}ms",
+        quantize_time.as_millis()
+    );
 
     println!("\n{}\n", "=".repeat(60));
     println!("Step 3: Testing quantized models...");
@@ -210,8 +257,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_time = test_start.elapsed();
 
     let original_acc = accuracy(&original_predictions, &labels);
-    println!("Original model - Accuracy: {:.2}%, Time: {:.2}ms", 
-             original_acc * 100.0, original_time.as_millis());
+    println!(
+        "Original model - Accuracy: {:.2}%, Time: {:.2}ms",
+        original_acc * 100.0,
+        original_time.as_millis()
+    );
 
     // Test Int8 quantized model
     println!("Testing Int8 quantized model...");
@@ -220,8 +270,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let int8_time = test_start.elapsed();
 
     let int8_acc = accuracy(&int8_predictions, &labels);
-    println!("Int8 quantized - Accuracy: {:.2}%, Time: {:.2}ms", 
-             int8_acc * 100.0, int8_time.as_millis());
+    println!(
+        "Int8 quantized - Accuracy: {:.2}%, Time: {:.2}ms",
+        int8_acc * 100.0,
+        int8_time.as_millis()
+    );
 
     // Test Float16 quantized model
     println!("Testing Float16 quantized model...");
@@ -230,14 +283,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f16_time = test_start.elapsed();
 
     let f16_acc = accuracy(&f16_predictions, &labels);
-    println!("Float16 quantized - Accuracy: {:.2}%, Time: {:.2}ms", 
-             f16_acc * 100.0, f16_time.as_millis());
+    println!(
+        "Float16 quantized - Accuracy: {:.2}%, Time: {:.2}ms",
+        f16_acc * 100.0,
+        f16_time.as_millis()
+    );
 
     println!("\n{}\n", "=".repeat(60));
     println!("Quantization Summary:");
-    println!("   Original model:  {:.2}% accuracy, {:.2}ms", original_acc * 100.0, original_time.as_millis());
-    println!("   Int8 quantized:  {:.2}% accuracy, {:.2}ms", int8_acc * 100.0, int8_time.as_millis());
-    println!("   Float16 quantized: {:.2}% accuracy, {:.2}ms", f16_acc * 100.0, f16_time.as_millis());
+    println!(
+        "   Original model:  {:.2}% accuracy, {:.2}ms",
+        original_acc * 100.0,
+        original_time.as_millis()
+    );
+    println!(
+        "   Int8 quantized:  {:.2}% accuracy, {:.2}ms",
+        int8_acc * 100.0,
+        int8_time.as_millis()
+    );
+    println!(
+        "   Float16 quantized: {:.2}% accuracy, {:.2}ms",
+        f16_acc * 100.0,
+        f16_time.as_millis()
+    );
 
     // Show some sample predictions
     println!("\nSample predictions (first 5):");
@@ -245,9 +313,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..5.min(batch_size) {
         let predicted = pred_classes.data()[i] as u8;
         let actual = labels.data()[i] as u8;
-        println!("   Sample {}: Predicted={}, Actual={} {}", 
-                 i + 1, predicted, actual, 
-                 if predicted == actual { "CORRECT" } else { "WRONG" });
+        println!(
+            "   Sample {}: Predicted={}, Actual={} {}",
+            i + 1,
+            predicted,
+            actual,
+            if predicted == actual {
+                "CORRECT"
+            } else {
+                "WRONG"
+            }
+        );
     }
 
     Ok(())

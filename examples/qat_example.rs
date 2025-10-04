@@ -1,5 +1,5 @@
 //! Quantization-Aware Training (QAT) Example
-//! 
+//!
 //! This example demonstrates how to use QAT in the Taper library.
 //! It shows the complete workflow from training with fake quantization
 //! to deploying a quantized model.
@@ -14,10 +14,10 @@ use taper::Tape;
 use taper::activation::ReLU;
 use taper::data::mnist::{DataLoader, MNISTDataset};
 use taper::loss::{accuracy, cross_entropy_loss};
-use taper::nn::{MaxPool2d, AdaptiveAvgPool2d, Module, Flatten};
-use taper::quantization::{QATConfig, QATLinear, QATConv2d, QATSequential};
-use taper::quantization::qat_manager::global;
+use taper::nn::{AdaptiveAvgPool2d, Flatten, MaxPool2d, Module};
 use taper::optim::Adam;
+use taper::quantization::qat_manager::global;
+use taper::quantization::{QATConfig, QATConv2d, QATLinear, QATSequential};
 use taper::train::Trainer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,45 +56,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![
             // First conv block
             Box::new(QATConv2d::new(
-                1, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-                &qat_config, Some("conv1".to_string())
+                1,
+                32,
+                (3, 3),
+                Some((1, 1)),
+                Some((1, 1)),
+                None,
+                None,
+                true,
+                &qat_config,
+                Some("conv1".to_string()),
             )),
             Box::new(QATConv2d::new(
-                32, 32, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-                &qat_config, Some("conv2".to_string())
+                32,
+                32,
+                (3, 3),
+                Some((1, 1)),
+                Some((1, 1)),
+                None,
+                None,
+                true,
+                &qat_config,
+                Some("conv2".to_string()),
             )),
             Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 28x28 -> 14x14
-
             // Second conv block
             Box::new(QATConv2d::new(
-                32, 64, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-                &qat_config, Some("conv3".to_string())
+                32,
+                64,
+                (3, 3),
+                Some((1, 1)),
+                Some((1, 1)),
+                None,
+                None,
+                true,
+                &qat_config,
+                Some("conv3".to_string()),
             )),
             Box::new(QATConv2d::new(
-                64, 64, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-                &qat_config, Some("conv4".to_string())
+                64,
+                64,
+                (3, 3),
+                Some((1, 1)),
+                Some((1, 1)),
+                None,
+                None,
+                true,
+                &qat_config,
+                Some("conv4".to_string()),
             )),
             Box::new(MaxPool2d::new((2, 2), Some((2, 2)), None)), // 14x14 -> 7x7
-
             // Third conv block
             Box::new(QATConv2d::new(
-                64, 128, (3, 3), Some((1, 1)), Some((1, 1)), None, None, true,
-                &qat_config, Some("conv5".to_string())
+                64,
+                128,
+                (3, 3),
+                Some((1, 1)),
+                Some((1, 1)),
+                None,
+                None,
+                true,
+                &qat_config,
+                Some("conv5".to_string()),
             )),
-
             // Global average pooling
             Box::new(AdaptiveAvgPool2d::global()), // 7x7x128 -> 1x1x128
             Box::new(Flatten::new(Some(1))),       // 128
-
             // Classifier
-            Box::new(QATLinear::new(128, 128, true, &qat_config, Some("linear1".to_string()))),
+            Box::new(QATLinear::new(
+                128,
+                128,
+                true,
+                &qat_config,
+                Some("linear1".to_string()),
+            )),
             Box::new(ReLU),
-            Box::new(QATLinear::new(128, 64, true, &qat_config, Some("linear2".to_string()))),
+            Box::new(QATLinear::new(
+                128,
+                64,
+                true,
+                &qat_config,
+                Some("linear2".to_string()),
+            )),
             Box::new(ReLU),
-            Box::new(QATLinear::new(64, 10, true, &qat_config, Some("linear3".to_string()))),   // 10 classes
+            Box::new(QATLinear::new(
+                64,
+                10,
+                true,
+                &qat_config,
+                Some("linear3".to_string()),
+            )), // 10 classes
         ],
         qat_config.clone(),
-        Some("main_model".to_string())
+        Some("main_model".to_string()),
     );
 
     // Count parameters
@@ -106,11 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let optimizer = Adam::new(params, 0.01, None, None, Some(0.0001));
 
     // Create trainer
-    let mut trainer = Trainer::new(
-        Box::new(model),
-        optimizer,
-        None,
-    );
+    let mut trainer = Trainer::new(Box::new(model), optimizer, None);
 
     println!("\n{}\n", "=".repeat(60));
     println!("Step 1: QAT Training (3 epochs)...");
@@ -126,7 +176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Epoch {}/3", epoch);
 
         // Training phase
-        trainer.model.parameters().iter().for_each(|p| p.zero_grad());
+        trainer
+            .model
+            .parameters()
+            .iter()
+            .for_each(|p| p.zero_grad());
 
         let mut train_loss = 0.0;
         let mut train_correct = 0;
@@ -237,8 +291,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eval_time = test_start.elapsed();
 
     let eval_acc = accuracy(&eval_predictions, &labels);
-    println!("Evaluation mode - Accuracy: {:.2}%, Time: {:.2}ms", 
-             eval_acc * 100.0, eval_time.as_millis());
+    println!(
+        "Evaluation mode - Accuracy: {:.2}%, Time: {:.2}ms",
+        eval_acc * 100.0,
+        eval_time.as_millis()
+    );
 
     // Show QAT status
     let status = global::get_status();
@@ -255,9 +312,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..5.min(batch_size) {
         let predicted = pred_classes.data()[i] as u8;
         let actual = labels.data()[i] as u8;
-        println!("   Sample {}: Predicted={}, Actual={} {}", 
-                 i + 1, predicted, actual, 
-                 if predicted == actual { "CORRECT" } else { "WRONG" });
+        println!(
+            "   Sample {}: Predicted={}, Actual={} {}",
+            i + 1,
+            predicted,
+            actual,
+            if predicted == actual {
+                "CORRECT"
+            } else {
+                "WRONG"
+            }
+        );
     }
 
     println!("\n{}\n", "=".repeat(60));

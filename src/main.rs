@@ -3,7 +3,6 @@ use taper::loss::bce_loss;
 use taper::nn::{Linear, Module, Sequential};
 use taper::optim::{Optimizer, SGD};
 use taper::{Tape, Tensor};
-use std::env;
 
 use mimalloc::MiMalloc;
 
@@ -25,7 +24,6 @@ fn main() {
         Box::new(Sigmoid),
     ]);
 
-
     let params = model.parameters();
     let mut opt = SGD::new(params, 0.10, None);
 
@@ -39,7 +37,7 @@ fn main() {
 
         // Use regular forward pass (quantization happens after training)
         let yhat = model.forward(&x);
-        
+
         let loss = bce_loss(&yhat, &y);
 
         loss.backward();
@@ -54,10 +52,10 @@ fn main() {
     // final eval
     let _tape = Tape::reset();
     let x = Tensor::new(x_data, &[4, 2]);
-    
+
     // Use regular forward pass for final evaluation
     let yhat = model.forward(&x);
-    
+
     let p = yhat.data();
 
     println!(
@@ -67,6 +65,4 @@ fn main() {
 
     let ok = (p[0] < 0.5) && (p[1] > 0.5) && (p[2] > 0.5) && (p[3] < 0.5);
     println!("{}", if ok { "learned XOR" } else { "not yet" });
-
 }
-

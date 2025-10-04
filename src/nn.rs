@@ -1,11 +1,14 @@
-use crate::{Tensor, QuantizationConfig};
-use rand::{distributions::{Distribution, Uniform}, Rng};
+use crate::{QuantizationConfig, Tensor};
+use rand::{
+    Rng,
+    distributions::{Distribution, Uniform},
+};
 
 /// Trait for any differentiable network component.
 pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
-    
+
     /// Quantize the model for inference
     fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
         panic!("Quantization not implemented for this module type")
@@ -80,7 +83,7 @@ impl QuantizedModule for QuantizedLinear {
     fn forward(&self, input: &Tensor) -> Tensor {
         let weight_f32 = self.weight.dequantize();
         let mut out = input.matmul(&weight_f32.transpose());
-        
+
         if let Some(b) = &self.bias {
             let bias_f32 = b.dequantize();
             out = out.add_broadcast(&bias_f32);
@@ -335,7 +338,7 @@ impl QuantizedModule for QuantizedConv2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         let weight_f32 = self.weight.dequantize();
         let bias_f32 = self.bias.as_ref().map(|b| b.dequantize());
-        
+
         if self.groups == 1 {
             // Standard convolution
             input.conv2d(
@@ -347,7 +350,12 @@ impl QuantizedModule for QuantizedConv2d {
             )
         } else {
             // Grouped convolution - split input and weight, convolve separately, then concatenate
-            let (_n, c_in, _h, _w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            let (_n, c_in, _h, _w) = (
+                input.shape()[0],
+                input.shape()[1],
+                input.shape()[2],
+                input.shape()[3],
+            );
             let c_out = weight_f32.shape()[0];
             let c_in_per_group = c_in / self.groups;
             let c_out_per_group = c_out / self.groups;
@@ -356,13 +364,17 @@ impl QuantizedModule for QuantizedConv2d {
 
             for g in 0..self.groups {
                 // Extract input channels for this group
-                let input_slice = input.slice_channels(g * c_in_per_group, (g + 1) * c_in_per_group);
+                let input_slice =
+                    input.slice_channels(g * c_in_per_group, (g + 1) * c_in_per_group);
 
                 // Extract weight channels for this group
-                let weight_slice = weight_f32.slice_output_channels(g * c_out_per_group, (g + 1) * c_out_per_group);
+                let weight_slice = weight_f32
+                    .slice_output_channels(g * c_out_per_group, (g + 1) * c_out_per_group);
 
                 // Extract bias for this group
-                let bias_slice = bias_f32.as_ref().map(|b| b.slice_1d(g * c_out_per_group, (g + 1) * c_out_per_group));
+                let bias_slice = bias_f32
+                    .as_ref()
+                    .map(|b| b.slice_1d(g * c_out_per_group, (g + 1) * c_out_per_group));
 
                 // Convolve
                 let group_out = input_slice.conv2d(
@@ -572,7 +584,12 @@ impl QuantizedModule for QuantizedAvgPool2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         if self.kernel_size == (0, 0) {
             // Global average pooling
-            let (_n, _c, h, w) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+            let (_n, _c, h, w) = (
+                input.shape()[0],
+                input.shape()[1],
+                input.shape()[2],
+                input.shape()[3],
+            );
             input.avg_pool2d((h, w), Some((1, 1)), (0, 0))
         } else {
             input.avg_pool2d(self.kernel_size, self.stride, self.padding)
@@ -637,7 +654,12 @@ pub struct QuantizedAdaptiveAvgPool2d {
 
 impl QuantizedModule for QuantizedAdaptiveAvgPool2d {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let (_n, _c, h_in, w_in) = (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3]);
+        let (_n, _c, h_in, w_in) = (
+            input.shape()[0],
+            input.shape()[1],
+            input.shape()[2],
+            input.shape()[3],
+        );
         let (h_out, w_out) = self.output_size;
 
         // Calculate kernel size and stride to achieve target output size
