@@ -1,4 +1,6 @@
-use crate::{QuantizationConfig, Tensor};
+use std::sync::{Arc, RwLock};
+
+use crate::{QuantizationConfig, QuantizedTensor, Tensor};
 use rand::{
     Rng,
     distributions::{Distribution, Uniform},
@@ -61,6 +63,8 @@ impl Module for Linear {
         Box::new(QuantizedLinear {
             weight: self.weight.quantize(qconfig),
             bias: self.bias.as_ref().map(|b| b.quantize(qconfig)),
+            cached_weight: Arc::new(RwLock::new(None)),
+            cached_bias: Arc::new(RwLock::new(None)), // Initialize cache
         })
     }
 
@@ -75,24 +79,49 @@ impl Module for Linear {
 
 /// Quantized Linear layer for inference
 pub struct QuantizedLinear {
-    weight: crate::tensor::QuantizedTensor,
-    bias: Option<crate::tensor::QuantizedTensor>,
+    weight: QuantizedTensor,
+    bias: Option<QuantizedTensor>,
+    cached_weight: Arc<RwLock<Option<Tensor>>>,
+    cached_bias: Arc<RwLock<Option<Tensor>>>,
 }
 
 impl QuantizedModule for QuantizedLinear {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let weight_f32 = self.weight.dequantize();
+        // Cache dequantized weight
+        let weight_f32 = {
+            let cache = self.cached_weight.read().unwrap();
+            if let Some(ref w) = *cache {
+                w.clone()
+            } else {
+                drop(cache);
+                let w = self.weight.dequantize();
+                *self.cached_weight.write().unwrap() = Some(w.clone());
+                w
+            }
+        };
+
         let mut out = input.matmul(&weight_f32.transpose());
 
-        if let Some(b) = &self.bias {
-            let bias_f32 = b.dequantize();
+        // Cache and apply bias if present
+        if let Some(ref bias_q) = self.bias {
+            let bias_f32 = {
+                let cache = self.cached_bias.read().unwrap();
+                if let Some(ref b) = *cache {
+                    b.clone()
+                } else {
+                    drop(cache);
+                    let b = bias_q.dequantize();
+                    *self.cached_bias.write().unwrap() = Some(b.clone());
+                    b
+                }
+            };
             out = out.add_broadcast(&bias_f32);
         }
+
         out
     }
 
     fn parameters(&self) -> Vec<Tensor> {
-        // Return empty for quantized modules since parameters are stored as QuantizedTensor
         vec![]
     }
 }

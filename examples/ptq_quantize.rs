@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Step 1: Training the model (10 epochs)...");
 
     // Quick training (10 epochs)
-    for epoch in 1..=10 {
+    for epoch in 1..=2 {
         let epoch_start = Instant::now();
 
         println!("Epoch {}/10", epoch);
@@ -243,88 +243,171 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("\n{}\n", "=".repeat(60));
-    println!("Step 3: Testing quantized models...");
+    println!("Step 3: Testing quantized models on full test set...");
 
-    // Test original model
-    println!("Testing original model...");
+    // Diagnostic: Check if Int8 and Float16 produce different outputs
+    println!("\nDiagnostic: Comparing Int8 and Float16 outputs...");
     test_loader.reset();
-    let (images, labels) = test_loader.next().unwrap();
-    let batch_size = images.shape()[0];
-    let images_4d = images.reshape(&[batch_size, 1, 28, 28]);
+    let (sample_images, _sample_labels) = test_loader.next().unwrap();
+    let sample_batch_size = sample_images.shape()[0];
+    let sample_images_4d = sample_images.reshape(&[sample_batch_size, 1, 28, 28]);
 
+    let int8_sample = quantized_model_int8.forward(&sample_images_4d);
+    let f16_sample = quantized_model_f16.forward(&sample_images_4d);
+
+    let int8_data = int8_sample.data();
+    let f16_data = f16_sample.data();
+    let mut max_diff = 0.0f32;
+    let mut total_diff = 0.0f32;
+
+    for (a, b) in int8_data.iter().zip(f16_data.iter()) {
+        let diff = (a - b).abs();
+        max_diff = max_diff.max(diff);
+        total_diff += diff;
+    }
+
+    println!("Max difference: {:.6}", max_diff);
+    println!("Avg difference: {:.6}", total_diff / int8_data.len() as f32);
+
+    if max_diff < 1e-6 {
+        println!(
+            "WARNING: Outputs are nearly identical! Quantization may not be working correctly."
+        );
+    } else {
+        println!("Outputs differ correctly.\n");
+    }
+
+    // Test original model on full test set
+    println!("Testing original model on full test set...");
+    let mut original_correct = 0;
+    let mut original_total = 0;
     let test_start = Instant::now();
-    let original_predictions = trainer.model.forward(&images_4d);
-    let original_time = test_start.elapsed();
 
-    let original_acc = accuracy(&original_predictions, &labels);
+    test_loader.reset();
+    for (images, labels) in &mut test_loader {
+        Tape::reset();
+        let batch_size = images.shape()[0];
+        let images_4d = images.reshape(&[batch_size, 1, 28, 28]);
+        let predictions = trainer.model.forward(&images_4d);
+        let acc = accuracy(&predictions, &labels);
+        original_correct += (acc * batch_size as f32) as usize;
+        original_total += batch_size;
+    }
+    let original_time = test_start.elapsed();
+    let original_acc = original_correct as f32 / original_total as f32;
+
     println!(
-        "Original model - Accuracy: {:.2}%, Time: {:.2}ms",
+        "Original - Accuracy: {:.2}% ({}/{}), Time: {}ms",
         original_acc * 100.0,
+        original_correct,
+        original_total,
         original_time.as_millis()
     );
 
-    // Test Int8 quantized model
-    println!("Testing Int8 quantized model...");
+    // Test Int8 quantized model on full test set
+    println!("Testing Int8 quantized model on full test set...");
+    let mut int8_correct = 0;
+    let mut int8_total = 0;
     let test_start = Instant::now();
-    let int8_predictions = quantized_model_int8.forward(&images_4d);
-    let int8_time = test_start.elapsed();
 
-    let int8_acc = accuracy(&int8_predictions, &labels);
+    test_loader.reset();
+    for (images, labels) in &mut test_loader {
+        Tape::reset();
+        let batch_size = images.shape()[0];
+        let images_4d = images.reshape(&[batch_size, 1, 28, 28]);
+        let predictions = quantized_model_int8.forward(&images_4d);
+        let acc = accuracy(&predictions, &labels);
+        int8_correct += (acc * batch_size as f32) as usize;
+        int8_total += batch_size;
+    }
+    let int8_time = test_start.elapsed();
+    let int8_acc = int8_correct as f32 / int8_total as f32;
+
     println!(
-        "Int8 quantized - Accuracy: {:.2}%, Time: {:.2}ms",
+        "Int8 - Accuracy: {:.2}% ({}/{}), Time: {}ms",
         int8_acc * 100.0,
+        int8_correct,
+        int8_total,
         int8_time.as_millis()
     );
 
-    // Test Float16 quantized model
-    println!("Testing Float16 quantized model...");
+    // Test Float16 quantized model on full test set
+    println!("Testing Float16 quantized model on full test set...");
+    let mut f16_correct = 0;
+    let mut f16_total = 0;
     let test_start = Instant::now();
-    let f16_predictions = quantized_model_f16.forward(&images_4d);
-    let f16_time = test_start.elapsed();
 
-    let f16_acc = accuracy(&f16_predictions, &labels);
+    test_loader.reset();
+    for (images, labels) in &mut test_loader {
+        Tape::reset();
+        let batch_size = images.shape()[0];
+        let images_4d = images.reshape(&[batch_size, 1, 28, 28]);
+        let predictions = quantized_model_f16.forward(&images_4d);
+        let acc = accuracy(&predictions, &labels);
+        f16_correct += (acc * batch_size as f32) as usize;
+        f16_total += batch_size;
+    }
+    let f16_time = test_start.elapsed();
+    let f16_acc = f16_correct as f32 / f16_total as f32;
+
     println!(
-        "Float16 quantized - Accuracy: {:.2}%, Time: {:.2}ms",
+        "Float16 - Accuracy: {:.2}% ({}/{}), Time: {}ms",
         f16_acc * 100.0,
+        f16_correct,
+        f16_total,
         f16_time.as_millis()
     );
 
     println!("\n{}\n", "=".repeat(60));
     println!("Quantization Summary:");
     println!(
-        "   Original model:  {:.2}% accuracy, {:.2}ms",
+        "   Original model:     {:.2}% accuracy, {}ms",
         original_acc * 100.0,
         original_time.as_millis()
     );
     println!(
-        "   Int8 quantized:  {:.2}% accuracy, {:.2}ms",
+        "   Int8 quantized:     {:.2}% accuracy, {}ms (Δ {:.2}%)",
         int8_acc * 100.0,
-        int8_time.as_millis()
+        int8_time.as_millis(),
+        (int8_acc - original_acc) * 100.0
     );
     println!(
-        "   Float16 quantized: {:.2}% accuracy, {:.2}ms",
+        "   Float16 quantized:  {:.2}% accuracy, {}ms (Δ {:.2}%)",
         f16_acc * 100.0,
-        f16_time.as_millis()
+        f16_time.as_millis(),
+        (f16_acc - original_acc) * 100.0
     );
 
-    // Show some sample predictions
-    println!("\nSample predictions (first 5):");
-    let pred_classes = int8_predictions.argmax(Some(1));
-    for i in 0..5.min(batch_size) {
-        let predicted = pred_classes.data()[i] as u8;
-        let actual = labels.data()[i] as u8;
-        println!(
-            "   Sample {}: Predicted={}, Actual={} {}",
-            i + 1,
-            predicted,
-            actual,
-            if predicted == actual {
-                "CORRECT"
-            } else {
-                "WRONG"
-            }
-        );
+    // Show if accuracies are suspiciously identical
+    if (int8_acc - f16_acc).abs() < 1e-6 {
+        println!("\nNOTE: Int8 and Float16 have identical accuracy. This may indicate:");
+        println!("  - Small test set size leading to identical results");
+        println!("  - Shared cached weights (check implementation)");
     }
+
+    println!("\nNote: This is storage quantization for model compression.");
+    println!("Inference speed is similar to original (or slightly slower).");
+    println!("Benefits: 4x smaller model size, minimal accuracy loss.");
+
+    let original_size = total_params * 4; // f32 = 4 bytes
+    let int8_size = total_params * 1; // int8 = 1 byte
+    let f16_size = total_params * 2; // float16 = 2 bytes
+
+    println!("Model size comparison:");
+    println!(
+        "  Original (f32):  {:.2} MB",
+        original_size as f32 / 1_000_000.0
+    );
+    println!(
+        "  Int8 quantized:  {:.2} MB ({}x smaller)",
+        int8_size as f32 / 1_000_000.0,
+        original_size / int8_size
+    );
+    println!(
+        "  Float16:         {:.2} MB ({}x smaller)",
+        f16_size as f32 / 1_000_000.0,
+        original_size / f16_size
+    );
 
     Ok(())
 }

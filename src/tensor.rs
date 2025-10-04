@@ -265,6 +265,7 @@ pub struct Int8Tensor {
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
+    min_val: f32, // Minimum value in original data
 }
 
 /// Int4 quantized tensor (packed representation - 2 values per byte)
@@ -345,6 +346,7 @@ impl Int8Tensor {
             shape,
             scale,
             zero_point,
+            min_val: 0.0, // Placeholder, should be set during quantization
         }
     }
 
@@ -352,7 +354,7 @@ impl Int8Tensor {
         let data = self.data();
         let f32_data: Vec<f32> = data
             .iter()
-            .map(|&q| (q as f32 - self.zero_point as f32) * self.scale)
+            .map(|&q| (q as i32 - self.zero_point) as f32 * self.scale + self.min_val)
             .collect();
 
         Tensor::new(f32_data, &self.shape)
@@ -411,10 +413,10 @@ impl Float16Tensor {
     }
 
     pub fn dequantize(&self) -> Tensor {
-        // TODO: Implement float16 to f32 conversion
-        // For now, return a dummy tensor
-        let size: usize = self.shape.iter().product();
-        Tensor::new(vec![0.0; size], &self.shape)
+        let data = self.data();
+        let f32_data: Vec<f32> = data.iter().map(|&x| Tensor::f16_to_f32(x)).collect();
+
+        Tensor::new(f32_data, &self.shape)
     }
 
     pub fn data(&self) -> std::cell::Ref<'_, Vec<u16>> {
@@ -2109,23 +2111,40 @@ impl Tensor {
         let data = self.data();
         let (qmin, qmax) = config.compute_range().unwrap();
 
-        // Calculate min/max and scale/zero_point
-        let min_val = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max_val = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
 
-        let scale = config.compute_scale(min_val, max_val).unwrap();
-        let zero_point = config.compute_zero_point(min_val, scale).unwrap();
+        for &val in data.iter() {
+            if val.is_finite() {
+                min_val = min_val.min(val);
+                max_val = max_val.max(val);
+            }
+        }
 
-        // Quantize
+        if min_val == max_val {
+            min_val -= 0.1;
+            max_val += 0.1;
+        }
+
+        let qrange = (qmax - qmin) as f32;
+        let scale = (max_val - min_val) / qrange;
+        let zero_point = qmin;
+
         let quantized_data: Vec<i8> = data
             .iter()
             .map(|&x| {
-                let q = ((x / scale) + zero_point as f32).round() as i32;
+                let q = ((x - min_val) / scale).round() as i32 + qmin;
                 q.clamp(qmin, qmax) as i8
             })
             .collect();
 
-        Int8Tensor::new(quantized_data, self.shape.clone(), scale, zero_point)
+        Int8Tensor {
+            data: Rc::new(RefCell::new(quantized_data)),
+            shape: self.shape.clone(),
+            scale,
+            zero_point,
+            min_val, // Store it!
+        }
     }
 
     /// Quantize to int4 (packed representation)
@@ -2141,12 +2160,10 @@ impl Tensor {
 
     /// Convert to float16
     fn quantize_to_float16(&self) -> Float16Tensor {
-        // For now, create a dummy float16 tensor
-        // TODO: Implement proper float16 conversion
-        let size: usize = self.shape.iter().product();
-        let dummy_data = vec![0u16; size];
+        let data = self.data();
+        let f16_data: Vec<u16> = data.iter().map(|&x| Self::f32_to_f16(x)).collect();
 
-        Float16Tensor::new(dummy_data, self.shape.clone())
+        Float16Tensor::new(f16_data, self.shape.clone())
     }
 
     /// Convert to bfloat16
@@ -2168,5 +2185,105 @@ impl Tensor {
         let dummy_data = vec![0u8; packed_size];
 
         NF4Tensor::new(dummy_data, self.shape.clone(), 1.0, 0)
+    }
+
+    /// Convert f32 to f16 (IEEE 754 half precision)
+    pub fn f32_to_f16(value: f32) -> u16 {
+        let bits = value.to_bits();
+
+        // Extract sign, exponent, mantissa from f32
+        let sign = (bits >> 31) & 0x1;
+        let exponent = (bits >> 23) & 0xFF;
+        let mantissa = bits & 0x7FFFFF;
+
+        // Handle special cases
+        if exponent == 0xFF {
+            // Infinity or NaN
+            let f16_mantissa = if mantissa != 0 { 0x200 } else { 0 }; // NaN gets non-zero mantissa
+            return ((sign << 15) | (0x1F << 10) | f16_mantissa) as u16;
+        }
+
+        if exponent == 0 && mantissa == 0 {
+            // Zero (positive or negative)
+            return (sign << 15) as u16;
+        }
+
+        // Convert exponent from f32 bias (127) to f16 bias (15)
+        let f16_exponent = (exponent as i32) - 127 + 15;
+
+        // Handle overflow/underflow
+        if f16_exponent >= 0x1F {
+            // Overflow to infinity
+            return ((sign << 15) | (0x1F << 10)) as u16;
+        }
+
+        if f16_exponent <= 0 {
+            // Underflow - convert to denormalized or zero
+            if f16_exponent < -10 {
+                // Too small, round to zero
+                return (sign << 15) as u16;
+            }
+
+            // Denormalized number
+            let shift = 1 - f16_exponent;
+            let f16_mantissa = (mantissa | 0x800000) >> (shift + 13);
+            return ((sign << 15) | f16_mantissa) as u16;
+        }
+
+        // Normal number
+        // Convert mantissa from 23 bits to 10 bits (with rounding)
+        let f16_mantissa = (mantissa + 0x1000) >> 13; // Round to nearest
+
+        ((sign << 15) | ((f16_exponent as u32) << 10) | (f16_mantissa as u32)) as u16
+    }
+
+    /// Convert f16 to f32 (IEEE 754 half precision)
+    pub fn f16_to_f32(value: u16) -> f32 {
+        let bits = value as u32;
+
+        // Extract sign, exponent, mantissa from f16
+        let sign = (bits >> 15) & 0x1;
+        let exponent = (bits >> 10) & 0x1F;
+        let mantissa = bits & 0x3FF;
+
+        // Handle special cases
+        if exponent == 0x1F {
+            // Infinity or NaN
+            let f32_exponent = 0xFF;
+            let f32_mantissa = if mantissa != 0 { mantissa << 13 } else { 0 };
+            let result_bits = (sign << 31) | (f32_exponent << 23) | f32_mantissa;
+            return f32::from_bits(result_bits);
+        }
+
+        if exponent == 0 {
+            if mantissa == 0 {
+                // Zero (positive or negative)
+                return f32::from_bits((sign << 31) as u32);
+            }
+
+            // Denormalized number - convert to normalized f32
+            let mut exp = -14i32;
+            let mut mant = mantissa;
+
+            // Normalize mantissa
+            while (mant & 0x400) == 0 {
+                mant <<= 1;
+                exp -= 1;
+            }
+
+            mant &= 0x3FF; // Remove leading 1
+            let f32_exponent = ((exp + 127) as u32) & 0xFF;
+            let f32_mantissa = mant << 13;
+            let result_bits = (sign << 31) | (f32_exponent << 23) | f32_mantissa;
+            return f32::from_bits(result_bits);
+        }
+
+        // Normal number
+        // Convert exponent from f16 bias (15) to f32 bias (127)
+        let f32_exponent = (exponent + 127 - 15) & 0xFF;
+        let f32_mantissa = mantissa << 13;
+
+        let result_bits = (sign << 31) | (f32_exponent << 23) | f32_mantissa;
+        f32::from_bits(result_bits)
     }
 }

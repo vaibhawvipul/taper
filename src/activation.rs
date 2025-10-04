@@ -1,4 +1,7 @@
-use crate::{Tensor, nn::{Module, QuantizedModule}, QuantizationConfig};
+use crate::{
+    QuantizationConfig, Tensor,
+    nn::{Module, QuantizedModule},
+};
 
 /// ReLU activation as a module
 pub struct ReLU;

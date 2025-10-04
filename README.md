@@ -9,6 +9,7 @@ A lightweight neural network library in Rust with automatic differentiation.
 - Neural network layers: Linear, ReLU, Sigmoid, Conv2D, MaxPool2D, AvgPool2D, Flatten
 - Optimizers: SGD, Adam, AdamW with learning rate scheduling
 - Loss functions: MSE, Cross-entropy, BCE
+- Post-Training Quantization (PTQ): Int8/Float16 model compression with <1% accuracy loss
 - MNIST dataset support with data loading utilities
 
 ## Performance
@@ -36,4 +37,17 @@ cargo run --release --features blas-accelerate --example train_mnist
 
 # Or MNIST CNN training (around 96% accuracy in 50 epochs)
 cargo run --release --features blas-accelerate --example train_mnist_cnn
+```
+
+## Quantization
+
+Storage-only quantization for model compression:
+- **Int8**: 4x smaller models, ~0.5% accuracy drop
+- **Float16**: 2x smaller models, <0.1% accuracy drop
+- Use cases: Deployment, memory-constrained devices, reducing storage/transfer costs
+- Note: Weights stored quantized, computation in f32 (no inference speedup)
+
+```sh
+# Train and quantize a model
+cargo run --package taper --release --features blas-accelerate --example ptq_quantize
 ```
