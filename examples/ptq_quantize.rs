@@ -110,13 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trainer = Trainer::new(Box::new(model), optimizer, None);
 
     println!("\n{}\n", "=".repeat(60));
-    println!("Step 1: Training the model (2 epochs)...");
+    println!("Step 1: Training the model (10 epochs)...");
 
-    // Quick training (2 epochs)
-    for epoch in 1..=2 {
+    // Quick training (10 epochs)
+    for epoch in 1..=10 {
         let epoch_start = Instant::now();
 
-        println!("Epoch {}/2", epoch);
+        println!("Epoch {}/10", epoch);
 
         // Training phase
         trainer

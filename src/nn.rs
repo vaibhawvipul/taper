@@ -449,8 +449,28 @@ impl Module for Conv2dReLU {
         )
     }
 
+    fn quantize(&self, qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
+        Box::new(QuantizedConv2dReLU {
+            conv: self.conv.quantize(qconfig),
+        })
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         self.conv.parameters()
+    }
+}
+
+pub struct QuantizedConv2dReLU {
+    conv: Box<dyn QuantizedModule>,
+}
+
+impl QuantizedModule for QuantizedConv2dReLU {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        self.conv.forward(input).relu()
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![]
     }
 }
 
