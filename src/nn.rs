@@ -273,6 +273,20 @@ impl Conv2d {
             true,
         )
     }
+
+    /// Create a 1x1 conv layer with stride (useful for projection shortcuts)
+    pub fn conv1x1_stride(in_channels: usize, out_channels: usize, stride: usize) -> Self {
+        Self::new(
+            in_channels,
+            out_channels,
+            (1, 1),
+            Some((stride, stride)),
+            None,
+            None,
+            None,
+            false,  // No bias in projection shortcuts (ResNet standard)
+        )
+    }
 }
 
 impl Module for Conv2d {
@@ -1013,5 +1027,62 @@ impl Tensor {
         }
 
         Tensor::new(result_data, &out_shape)
+    }
+}
+
+/// Generic Residual/Skip Connection module
+/// Implements: output = main_path(x) + shortcut(x)
+/// Where shortcut can be identity (x) or a projection (e.g., 1x1 conv)
+pub struct Residual {
+    main_path: Box<dyn Module>,
+    shortcut: Option<Box<dyn Module>>,
+}
+
+impl std::fmt::Debug for Residual {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Residual")
+            .field("has_projection", &self.shortcut.is_some())
+            .finish()
+    }
+}
+
+impl Residual {
+    /// Create residual block with identity shortcut: output = main_path(x) + x
+    pub fn identity(main_path: Box<dyn Module>) -> Self {
+        Residual {
+            main_path,
+            shortcut: None,
+        }
+    }
+
+    /// Create residual block with projection shortcut: output = main_path(x) + shortcut(x)
+    /// Use this when input/output dimensions don't match
+    pub fn with_projection(main_path: Box<dyn Module>, shortcut: Box<dyn Module>) -> Self {
+        Residual {
+            main_path,
+            shortcut: Some(shortcut),
+        }
+    }
+}
+
+impl Module for Residual {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let main_out = self.main_path.forward(input);
+        
+        let skip_out = match &self.shortcut {
+            Some(projection) => projection.forward(input),
+            None => input.clone(),
+        };
+        
+        // Element-wise addition with autograd support
+        main_out + skip_out
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = self.main_path.parameters();
+        if let Some(proj) = &self.shortcut {
+            params.extend(proj.parameters());
+        }
+        params
     }
 }

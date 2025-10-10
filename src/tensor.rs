@@ -1697,8 +1697,8 @@ impl Tensor {
                 pad_h,
                 pad_w,
             );
-        } else if k_h == 1 && k_w == 1 {
-            // 1x1 is already optimal
+        } else if k_h == 1 && k_w == 1 && stride_h == 1 && stride_w == 1 {
+            // 1x1 with stride=1 is already optimal (no spatial downsampling)
             self.im2col_1x1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out);
         } else {
             // Parallelize general case
