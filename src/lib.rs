@@ -3,6 +3,7 @@ pub mod data;
 pub mod gemm;
 pub mod loss;
 pub mod nn;
+pub mod norm;
 pub mod ops;
 pub mod optim;
 pub mod quantization;
