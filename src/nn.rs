@@ -1,6 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use crate::{QuantizationConfig, QuantizedTensor, Tensor};
+use crate::norm::BatchNorm2d;
+use crate::activation::ReLU;
 use rand::{
     Rng,
     distributions::{Distribution, Uniform},
@@ -840,32 +842,147 @@ impl Module for Dropout {
     }
 }
 
-/// Basic CNN block: Conv -> BatchNorm -> ReLU (BatchNorm will be added later)
-#[derive(Debug)]
 pub struct BasicBlock {
-    conv: Conv2d,
-    // batchnorm: BatchNorm2d, // TODO: Add when BatchNorm2d is implemented
+    conv1: Conv2d,
+    bn1: BatchNorm2d, 
+    relu: ReLU,
+    conv2: Conv2d, 
+    bn2: BatchNorm2d, 
+    downsample: Option<Box<dyn Module>>,
 }
 
 impl BasicBlock {
     pub fn new(in_channels: usize, out_channels: usize, stride: usize) -> Self {
         BasicBlock {
-            conv: Conv2d::conv3x3(in_channels, out_channels, stride, 1),
-            // batchnorm: BatchNorm2d::new(out_channels),
+            conv1: Conv2d::conv3x3(in_channels, out_channels, stride, 1),
+            bn1: BatchNorm2d::new(out_channels), 
+            relu: ReLU, 
+            conv2: Conv2d::conv3x3(out_channels, out_channels, 1, 1),
+            bn2: BatchNorm2d::new(out_channels), 
+            downsample: if in_channels != out_channels || stride != 1 {
+                Some(Box::new(Conv2d::conv1x1_stride(in_channels, out_channels, stride)))
+            } else {
+                None
+            }
         }
     }
 }
 
 impl Module for BasicBlock {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let out = self.conv.forward(input);
-        // let out = self.batchnorm.forward(&out); // TODO: Add when BatchNorm2d is implemented
+        let mut identity = input.clone(); 
+        let mut out = self.conv1.forward(input);
+        out = self.bn1.forward(&out); 
+        out = out.relu();  
+
+        out = self.conv2.forward(&out); 
+        out = self.bn2.forward(&out); 
+
+        if let Some(downsample) = &self.downsample {
+            identity = downsample.forward(&identity); 
+        }
+
+        out = out + identity; 
         out.relu()
     }
 
     fn parameters(&self) -> Vec<Tensor> {
-        let params = self.conv.parameters();
-        // params.extend(self.batchnorm.parameters()); // TODO: Add when BatchNorm2d is implemented
+        let mut params = Vec::new(); 
+
+        params.extend(self.conv1.parameters()); 
+        params.extend(self.bn1.parameters()); 
+
+        params.extend(self.conv2.parameters()); 
+        params.extend(self.bn2.parameters()); 
+
+        // no params for relu 
+        if let Some(downsample) = &self.downsample {
+            params.extend(downsample.parameters()); 
+        }
+
+        params
+    }
+}
+
+pub struct BottleneckBlock {
+    expansion_factor: usize, 
+
+    conv1: Conv2d, 
+    bn1: BatchNorm2d, 
+
+    conv2: Conv2d, 
+    bn2: BatchNorm2d, 
+
+    conv3: Conv2d, 
+    bn3: BatchNorm2d, 
+
+    relu: ReLU,
+    downsample: Option<Box<dyn Module>>,
+}
+
+impl BottleneckBlock {
+    pub fn new(in_channels: usize, out_channels: usize, stride: usize) -> Self {
+        let expansion = 4; 
+        let mid_channels = out_channels / expansion; 
+
+        BottleneckBlock {
+            expansion_factor: expansion,
+            conv1: Conv2d::conv1x1(in_channels, mid_channels), 
+            bn1: BatchNorm2d::new(mid_channels), 
+            
+            conv2: Conv2d::conv3x3(mid_channels, mid_channels, stride, 1), 
+            bn2: BatchNorm2d::new(mid_channels), 
+
+            conv3: Conv2d::conv1x1(mid_channels, out_channels), 
+            bn3: BatchNorm2d::new(out_channels), 
+
+            relu: ReLU, 
+            downsample: if in_channels != out_channels || stride != 1 {
+                Some(Box::new(Conv2d::conv1x1_stride(in_channels, out_channels, stride)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Module for BottleneckBlock {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let mut identity = input.clone();
+        
+        let mut out = self.conv1.forward(input);
+        out = self.bn1.forward(&out);
+        out = out.relu();
+        
+        out = self.conv2.forward(&out);
+        out = self.bn2.forward(&out);
+        out = out.relu();
+        
+        out = self.conv3.forward(&out);
+        out = self.bn3.forward(&out);
+        
+        if let Some(downsample) = &self.downsample {
+            identity = downsample.forward(&identity);
+        }
+        
+        // Add + ReLU
+        out = out + identity;
+        out.relu()
+    }
+    
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = Vec::new();
+        params.extend(self.conv1.parameters());
+        params.extend(self.bn1.parameters());
+        params.extend(self.conv2.parameters());
+        params.extend(self.bn2.parameters());
+        params.extend(self.conv3.parameters());
+        params.extend(self.bn3.parameters());
+        
+        if let Some(downsample) = &self.downsample {
+            params.extend(downsample.parameters());
+        }
+        
         params
     }
 }

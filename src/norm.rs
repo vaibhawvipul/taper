@@ -138,7 +138,7 @@ impl Module for BatchNorm2d {
             let beta = self.beta.clone();
             let out = output.clone();
             
-            Tape::push_backward(move || {
+            Tape::push_unary_op(&inp.clone(), &output, move || {
                 if let Some(grad_out) = out.grad.read().unwrap().as_ref() {
                     let grad_out_data = grad_out;
                     
@@ -177,7 +177,7 @@ impl Module for BatchNorm2d {
                         let gamma_data = gamma.data();
                         
                         for ch in 0..c {
-                            let mean = means[ch];
+                            let _mean = means[ch];
                             let std = stds[ch];
                             let gamma_val = gamma_data[ch];
                             
