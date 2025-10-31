@@ -564,6 +564,7 @@ impl Module for MaxPool2d {
     }
 }
 
+
 /// Quantized MaxPool2d layer for inference
 pub struct QuantizedMaxPool2d {
     kernel_size: (usize, usize),
@@ -845,6 +846,7 @@ impl Module for Dropout {
 pub struct BasicBlock {
     conv1: Conv2d,
     bn1: BatchNorm2d, 
+    #[allow(dead_code)]
     relu: ReLU,
     conv2: Conv2d, 
     bn2: BatchNorm2d, 
@@ -905,6 +907,7 @@ impl Module for BasicBlock {
 }
 
 pub struct BottleneckBlock {
+    #[allow(dead_code)]
     expansion_factor: usize, 
 
     conv1: Conv2d, 
@@ -916,6 +919,7 @@ pub struct BottleneckBlock {
     conv3: Conv2d, 
     bn3: BatchNorm2d, 
 
+    #[allow(dead_code)]
     relu: ReLU,
     downsample: Option<Box<dyn Module>>,
 }

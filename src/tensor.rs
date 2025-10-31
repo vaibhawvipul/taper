@@ -1281,8 +1281,64 @@ impl Tensor {
             output = output.add_bias_4d(b);
         }
 
+        // Register with Tape system for autograd
+        if self.requires_grad || weight.requires_grad || bias.map_or(false, |b| b.requires_grad) {
+            output.requires_grad = true;
+            let input = self.clone();
+            let weight_t = weight.clone();
+            let bias_t = bias.cloned();
+            let out = output.clone();
+            let (_stride, _padding, _dilation) = (stride, padding, dilation);
+
+            Tape::push_binary_op(self, weight, &output, move || {
+                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                    // CRITICAL FIX: Proper convolution gradient computation
+                    
+                    // Gradient w.r.t. input: Use convolution transpose (deconvolution)
+                    if input.requires_grad {
+                        let input_grad = Self::conv_transpose2d_for_grad(
+                            gout, &weight_t, n, c_in, h_in, w_in, c_out, h_out, w_out,
+                            k_h, k_w, stride_h, stride_w, pad_h, pad_w
+                        );
+                        ops::accumulate_grad(&input, &input_grad);
+                    }
+
+                    // Gradient w.r.t. weight: Use proper convolution with input
+                    if weight_t.requires_grad {
+                        let weight_grad = Self::conv2d_weight_grad(
+                            &input, gout, n, c_in, h_in, w_in, c_out, h_out, w_out,
+                            k_h, k_w, stride_h, stride_w, pad_h, pad_w
+                        );
+                        ops::accumulate_grad(&weight_t, &weight_grad);
+                    }
+
+                    // Gradient w.r.t. bias: sum over spatial dimensions (this was correct)
+                    if let Some(bias_tensor) = bias_t.as_ref() {
+                        if bias_tensor.requires_grad {
+                            let mut bias_grad = vec![0.0; c_out];
+                            for n_idx in 0..n {
+                                for c in 0..c_out {
+                                    for h in 0..h_out {
+                                        for w in 0..w_out {
+                                            let idx = n_idx * c_out * h_out * w_out + c * h_out * w_out + h * w_out + w;
+                                            if idx < gout.len() {
+                                                bias_grad[c] += gout[idx];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            ops::accumulate_grad(bias_tensor, &bias_grad);
+                        }
+                    }
+                }
+            });
+        }
+
         output
     }
+
 
     pub fn conv2d_direct_3x3(
         &self,
@@ -2235,6 +2291,107 @@ impl Tensor {
         let f16_mantissa = (mantissa + 0x1000) >> 13; // Round to nearest
 
         ((sign << 15) | ((f16_exponent as u32) << 10) | (f16_mantissa as u32)) as u16
+    }
+
+    /// Helper function for convolution transpose (deconvolution) for input gradients
+    fn conv_transpose2d_for_grad(
+        grad_output: &[f32],
+        weight: &Tensor,
+        n: usize, c_in: usize, h_in: usize, w_in: usize,
+        c_out: usize, h_out: usize, w_out: usize,
+        k_h: usize, k_w: usize, stride_h: usize, stride_w: usize,
+        _pad_h: usize, _pad_w: usize
+    ) -> Vec<f32> {
+        let mut grad_input = vec![0.0; n * c_in * h_in * w_in];
+        let weight_data = weight.data();
+        
+        // For each output position, distribute gradient back to input positions
+        for n_idx in 0..n {
+            for c_out_idx in 0..c_out {
+                for h_out_idx in 0..h_out {
+                    for w_out_idx in 0..w_out {
+                        let out_idx = n_idx * c_out * h_out * w_out + 
+                                     c_out_idx * h_out * w_out + 
+                                     h_out_idx * w_out + w_out_idx;
+                        let grad_val = grad_output[out_idx];
+                        
+                        // Apply weight to distribute gradient back to input
+                        for k_h_idx in 0..k_h {
+                            for k_w_idx in 0..k_w {
+                                let h_in_idx = h_out_idx * stride_h + k_h_idx;
+                                let w_in_idx = w_out_idx * stride_w + k_w_idx;
+                                
+                                // Check bounds
+                                if h_in_idx < h_in && w_in_idx < w_in {
+                                    for c_in_idx in 0..c_in {
+                                        let weight_idx = c_out_idx * c_in * k_h * k_w + 
+                                                       c_in_idx * k_h * k_w + 
+                                                       k_h_idx * k_w + k_w_idx;
+                                        let input_idx = n_idx * c_in * h_in * w_in + 
+                                                      c_in_idx * h_in * w_in + 
+                                                      h_in_idx * w_in + w_in_idx;
+                                        
+                                        grad_input[input_idx] += grad_val * weight_data[weight_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        grad_input
+    }
+    
+    /// Helper function for weight gradients using convolution
+    fn conv2d_weight_grad(
+        input: &Tensor,
+        grad_output: &[f32],
+        n: usize, c_in: usize, h_in: usize, w_in: usize,
+        c_out: usize, h_out: usize, w_out: usize,
+        k_h: usize, k_w: usize, stride_h: usize, stride_w: usize,
+        _pad_h: usize, _pad_w: usize
+    ) -> Vec<f32> {
+        let mut grad_weight = vec![0.0; c_out * c_in * k_h * k_w];
+        let input_data = input.data();
+        
+        // For each weight position, accumulate gradients
+        for c_out_idx in 0..c_out {
+            for c_in_idx in 0..c_in {
+                for k_h_idx in 0..k_h {
+                    for k_w_idx in 0..k_w {
+                        let weight_idx = c_out_idx * c_in * k_h * k_w + 
+                                       c_in_idx * k_h * k_w + 
+                                       k_h_idx * k_w + k_w_idx;
+                        
+                        // Accumulate gradients from all input positions
+                        for n_idx in 0..n {
+                            for h_out_idx in 0..h_out {
+                                for w_out_idx in 0..w_out {
+                                    let h_in_idx = h_out_idx * stride_h + k_h_idx;
+                                    let w_in_idx = w_out_idx * stride_w + k_w_idx;
+                                    
+                                    // Check bounds
+                                    if h_in_idx < h_in && w_in_idx < w_in {
+                                        let input_idx = n_idx * c_in * h_in * w_in + 
+                                                      c_in_idx * h_in * w_in + 
+                                                      h_in_idx * w_in + w_in_idx;
+                                        let out_idx = n_idx * c_out * h_out * w_out + 
+                                                    c_out_idx * h_out * w_out + 
+                                                    h_out_idx * w_out + w_out_idx;
+                                        
+                                        grad_weight[weight_idx] += input_data[input_idx] * grad_output[out_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        grad_weight
     }
 
     /// Convert f16 to f32 (IEEE 754 half precision)

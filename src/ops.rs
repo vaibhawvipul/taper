@@ -127,13 +127,12 @@ pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
         *slot = Some(vec![0.0; t.data().len()]);
     }
     let g = slot.as_mut().unwrap();
-    // SIMD accumulate
-    let mut temp = vec![0.0; g.len()];
-
-    unsafe {
-        simd::add_f32_simd(g, src, &mut temp);
+    
+    // CRITICAL FIX: Add gradients instead of replacing them
+    // This was the main cause of training failure
+    for (gi, &si) in g.iter_mut().zip(src.iter()) {
+        *gi += si;  // Accumulate, don't replace
     }
-    *g = temp;
 }
 
 #[inline]
@@ -144,9 +143,39 @@ pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
     }
     let g = slot.as_mut().unwrap();
 
-    // Scale and accumulate
+    // Scale and accumulate (this one was already correct)
     for (gi, &s) in g.iter_mut().zip(src) {
         *gi += scale * s;
+    }
+}
+
+/// Gradient clipping to prevent gradient explosion
+/// Clips gradients to have a maximum norm of max_norm
+pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
+    let mut total_norm = 0.0;
+    
+    // Calculate total norm across all parameters
+    for param in params {
+        if let Some(grad) = param.grad_ref() {
+            for &g in grad.iter() {
+                total_norm += g * g;
+            }
+        }
+    }
+    total_norm = total_norm.sqrt();
+    
+    // Clip if necessary
+    if total_norm > max_norm {
+        let clip_coef = max_norm / (total_norm + 1e-6);
+        for param in params {
+            if let Some(grad) = param.grad_ref() {
+                let mut grad_data = grad.as_ref().clone();
+                for g in grad_data.iter_mut() {
+                    *g *= clip_coef;
+                }
+                *param.grad.write().unwrap() = Some(grad_data);
+            }
+        }
     }
 }
 
