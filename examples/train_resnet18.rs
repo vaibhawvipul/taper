@@ -16,7 +16,6 @@ use taper::train::Trainer;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("ResNet-18 MNIST Training\n");
 
-    // Load MNIST dataset
     println!("Loading MNIST dataset...");
     let train_dataset = MNISTDataset::new(true, None)?;
     let test_dataset = MNISTDataset::new(false, None)?;
@@ -24,33 +23,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Training set: {} samples", train_dataset.len());
     println!("Test set: {} samples\n", test_dataset.len());
 
-    // Create data loaders
     let batch_size = 32; // Smaller batch for faster iteration during debugging
     let mut train_loader = DataLoader::new(train_dataset, batch_size, true);
     let mut test_loader = DataLoader::new(test_dataset, batch_size, false);
 
-    // Build ResNet-18 model for MNIST (10 classes) with single-channel input
     println!("Building ResNet-18 model...");
     let model = ResNet::resnet18_single_channel(10);
 
-    // Count parameters
     let params = model.parameters();
     let total_params: usize = params.iter().map(|p| p.data().len()).sum();
     println!("Total parameters: {}", total_params);
 
-    // Create optimizer with higher learning rate for ResNet
     let learning_rate = 0.01; // Increased LR for faster convergence
     let optimizer = Adam::new(params, learning_rate, None, None, Some(0.0001));
 
-    // Create learning rate scheduler
     let scheduler = Box::new(taper::optim::StepLR::new(learning_rate, 5, 0.5));
     
-    // Create trainer
     let mut trainer = Trainer::new(Box::new(model), optimizer, Some(scheduler));
 
-    // Training settings
-    let epochs = 5; // Reduced epochs for faster testing  
-    let log_interval = 1; // Log every batch for debugging
+    let epochs = 5;
+    let log_interval = 1;
 
     println!("\nTraining Configuration:");
     println!("   Model: ResNet-18");
@@ -89,25 +81,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let images_4d = images.reshape(&[batch_size, 1, 28, 28]);
             // Note: MNIST data loader already returns normalized data [0,1] range
 
-            // Forward pass
             let logits = trainer.model.forward(&images_4d);
 
-            // Compute loss
             let loss = cross_entropy_loss(&logits, &labels);
 
-            // Compute accuracy
             let batch_acc = accuracy(&logits, &labels);
             train_correct += (batch_acc * labels.shape()[0] as f32) as usize;
             train_total += labels.shape()[0];
 
-            // Backward pass
             loss.backward();
 
-            // Gradient clipping to prevent explosion (relaxed from 1.0 to 10.0)
             let params = trainer.model.parameters();
-            taper::ops::clip_grad_norm(&params, 10.0); // Clip gradients to max norm of 10.0
+            taper::ops::clip_grad_norm(&params, 10.0);
 
-            // Update weights
             trainer.optimizer.step();
             trainer.optimizer.zero_grad();
             
