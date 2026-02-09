@@ -1,7 +1,5 @@
 use crate::{ops, quantization::QuantizationConfig, tape::Tape};
 use smallvec::SmallVec;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
 use rayon::prelude::*;
@@ -261,7 +259,7 @@ pub enum QuantizedTensor {
 /// Int8 quantized tensor
 #[derive(Clone, Debug)]
 pub struct Int8Tensor {
-    data: Rc<RefCell<Vec<i8>>>,
+    data: Arc<RwLock<Vec<i8>>>,
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
@@ -272,7 +270,7 @@ pub struct Int8Tensor {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Int4Tensor {
-    data: Rc<RefCell<Vec<u8>>>, // Packed: 2 int4 values per u8
+    data: Arc<RwLock<Vec<u8>>>, // Packed: 2 int4 values per u8
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
@@ -281,14 +279,14 @@ pub struct Int4Tensor {
 /// Float16 quantized tensor
 #[derive(Clone, Debug)]
 pub struct Float16Tensor {
-    data: Rc<RefCell<Vec<u16>>>, // Float16 stored as u16
+    data: Arc<RwLock<Vec<u16>>>, // Float16 stored as u16
     shape: SmallVec<[usize; 4]>,
 }
 
 /// BFloat16 quantized tensor
 #[derive(Clone, Debug)]
 pub struct BFloat16Tensor {
-    data: Rc<RefCell<Vec<u16>>>, // BFloat16 stored as u16
+    data: Arc<RwLock<Vec<u16>>>, // BFloat16 stored as u16
     shape: SmallVec<[usize; 4]>,
 }
 
@@ -296,7 +294,7 @@ pub struct BFloat16Tensor {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct NF4Tensor {
-    data: Rc<RefCell<Vec<u8>>>, // Packed NF4 values
+    data: Arc<RwLock<Vec<u8>>>, // Packed NF4 values
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
@@ -342,7 +340,7 @@ impl QuantizedTensor {
 impl Int8Tensor {
     pub fn new(data: Vec<i8>, shape: SmallVec<[usize; 4]>, scale: f32, zero_point: i32) -> Self {
         Self {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape,
             scale,
             zero_point,
@@ -360,8 +358,8 @@ impl Int8Tensor {
         Tensor::new(f32_data, &self.shape)
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<i8>> {
-        self.data.borrow()
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<i8>> {
+        self.data.read().expect("Int8Tensor data lock poisoned")
     }
 
     pub fn scale(&self) -> f32 {
@@ -376,7 +374,7 @@ impl Int8Tensor {
 impl Int4Tensor {
     pub fn new(data: Vec<u8>, shape: SmallVec<[usize; 4]>, scale: f32, zero_point: i32) -> Self {
         Self {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape,
             scale,
             zero_point,
@@ -384,32 +382,29 @@ impl Int4Tensor {
     }
 
     pub fn dequantize(&self) -> Tensor {
-        // TODO: Implement int4 unpacking and dequantization
-        // For now, return a dummy tensor
-        let size: usize = self.shape.iter().product();
-        Tensor::new(vec![0.0; size], &self.shape)
+        unimplemented!(
+            "Int4 dequantization not yet implemented: unpacking and scale/zero_point conversion needed"
+        )
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<u8>> {
-        self.data.borrow()
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+        self.data.read().expect("Int4Tensor data lock poisoned")
     }
 }
 
 impl Float16Tensor {
     pub fn new(data: Vec<u16>, shape: SmallVec<[usize; 4]>) -> Self {
         Self {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape,
         }
     }
 
-    /// Create a float16 tensor from an f32 tensor (for non-quantized case)
+    /// Create a float16 tensor from an f32 tensor
     pub fn from_f32_tensor(tensor: &Tensor) -> Self {
-        // For non-quantized case, just store as dummy float16
-        let size: usize = tensor.shape.iter().product();
-        let dummy_data = vec![0u16; size];
-
-        Self::new(dummy_data, tensor.shape.clone())
+        let data = tensor.data();
+        let f16_data: Vec<u16> = data.iter().map(|&x| Tensor::f32_to_f16(x)).collect();
+        Self::new(f16_data, tensor.shape.clone())
     }
 
     pub fn dequantize(&self) -> Tensor {
@@ -419,35 +414,32 @@ impl Float16Tensor {
         Tensor::new(f32_data, &self.shape)
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<u16>> {
-        self.data.borrow()
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u16>> {
+        self.data.read().expect("Float16Tensor data lock poisoned")
     }
 }
 
 impl BFloat16Tensor {
     pub fn new(data: Vec<u16>, shape: SmallVec<[usize; 4]>) -> Self {
         Self {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape,
         }
     }
 
     pub fn dequantize(&self) -> Tensor {
-        // TODO: Implement bfloat16 to f32 conversion
-        // For now, return a dummy tensor
-        let size: usize = self.shape.iter().product();
-        Tensor::new(vec![0.0; size], &self.shape)
+        unimplemented!("BFloat16 dequantization not yet implemented: bf16-to-f32 conversion needed")
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<u16>> {
-        self.data.borrow()
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u16>> {
+        self.data.read().expect("BFloat16Tensor data lock poisoned")
     }
 }
 
 impl NF4Tensor {
     pub fn new(data: Vec<u8>, shape: SmallVec<[usize; 4]>, scale: f32, zero_point: i32) -> Self {
         Self {
-            data: Rc::new(RefCell::new(data)),
+            data: Arc::new(RwLock::new(data)),
             shape,
             scale,
             zero_point,
@@ -455,14 +447,13 @@ impl NF4Tensor {
     }
 
     pub fn dequantize(&self) -> Tensor {
-        // TODO: Implement NF4 unpacking and dequantization
-        // For now, return a dummy tensor
-        let size: usize = self.shape.iter().product();
-        Tensor::new(vec![0.0; size], &self.shape)
+        unimplemented!(
+            "NF4 dequantization not yet implemented: NF4 unpacking and lookup table conversion needed"
+        )
     }
 
-    pub fn data(&self) -> std::cell::Ref<'_, Vec<u8>> {
-        self.data.borrow()
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+        self.data.read().expect("NF4Tensor data lock poisoned")
     }
 }
 
@@ -769,6 +760,85 @@ impl Tensor {
         out
     }
 
+    /// Row-wise broadcasted division: [B,C] / [B,1] -> [B,C]
+    pub fn div_broadcast_rows(&self, other: &Tensor) -> Tensor {
+        // Fast path: exact same shape
+        if self.shape == other.shape {
+            return self / other;
+        }
+
+        // Expect [B,C] / [B,1]
+        assert!(
+            self.shape.len() == 2
+                && other.shape.len() == 2
+                && self.shape[0] == other.shape[0]
+                && other.shape[1] == 1,
+            "Unsupported broadcasting shapes for div_broadcast_rows: {:?} / {:?}",
+            self.shape,
+            other.shape
+        );
+
+        let (b, c) = (self.shape[0], self.shape[1]);
+        let a_data = self.data();
+        let r_data = other.data();
+
+        // Forward
+        let mut out_data = vec![0.0; a_data.len()];
+        for row in 0..b {
+            let base = row * c;
+            let r = r_data[row];
+            for col in 0..c {
+                out_data[base + col] = a_data[base + col] / r;
+            }
+        }
+        let mut out = Tensor::new(out_data, &self.shape);
+
+        if self.requires_grad || other.requires_grad {
+            out.requires_grad = true;
+            let a = self.clone();
+            let r = other.clone();
+            let o = out.clone();
+
+            Tape::push_binary_op(self, other, &out, move || {
+                if let Some(gout) = o.grad.read().unwrap().as_ref() {
+                    // dL/dA[row,col] = gout[row,col] / R[row]
+                    if a.requires_grad {
+                        let (b, c) = (a.shape[0], a.shape[1]);
+                        let r_data = r.data();
+                        let mut grad_a = vec![0.0; b * c];
+                        for row in 0..b {
+                            let base = row * c;
+                            let rv = r_data[row];
+                            for col in 0..c {
+                                grad_a[base + col] = gout[base + col] / rv;
+                            }
+                        }
+                        ops::accumulate_grad(&a, &grad_a);
+                    }
+                    // dL/dR[row] = -sum_c( gout[row,c] * A[row,c] ) / R[row]^2
+                    if r.requires_grad {
+                        let (b, c) = (a.shape[0], a.shape[1]);
+                        let a_data = a.data();
+                        let r_data = r.data();
+                        let mut grad_r = vec![0.0; b];
+                        for row in 0..b {
+                            let base = row * c;
+                            let rv = r_data[row];
+                            let mut s = 0.0;
+                            for col in 0..c {
+                                s += gout[base + col] * a_data[base + col];
+                            }
+                            grad_r[row] = -s / (rv * rv);
+                        }
+                        ops::accumulate_grad(&r, &grad_r);
+                    }
+                }
+            });
+        }
+
+        out
+    }
+
     pub fn mean(&self) -> Tensor {
         let data = self.data();
         let sum: f32 = data.iter().sum();
@@ -943,6 +1013,7 @@ impl Tensor {
                 let input = self.clone();
                 let out = output.clone();
                 let in_shape = self.shape.clone();
+                let out_shape_captured = out_shape.clone();
                 let keepdim = keepdim;
                 let d = d;
 
@@ -968,24 +1039,20 @@ impl Tensor {
 
                                 if j != d {
                                     let out_j = if j > d && !keepdim { j - 1 } else { j };
-                                    if out_j < gout.len() {
+                                    if out_j < out_shape_captured.len() {
                                         out_idx += coord * multiplier;
-                                        multiplier *= if keepdim {
-                                            if j == d { 1 } else { in_shape[j] }
-                                        } else {
-                                            if j < d {
-                                                in_shape[j]
-                                            } else if j > d {
-                                                in_shape[j]
-                                            } else {
-                                                1
-                                            }
-                                        };
+                                        multiplier *= out_shape_captured[out_j];
                                     }
                                 }
                             }
 
-                            gin[i] += gout[out_idx.min(gout.len() - 1)];
+                            debug_assert!(
+                                out_idx < gout.len(),
+                                "sum backward: out_idx {} out of bounds for gout len {}",
+                                out_idx,
+                                gout.len()
+                            );
+                            gin[i] += gout[out_idx];
                         }
                     }
                 });
@@ -1065,8 +1132,60 @@ impl Tensor {
                 }
             }
 
-            let values = Tensor::new(max_values, &out_shape);
-            let indices = Tensor::new(max_indices, &out_shape);
+            let mut values = Tensor::new(max_values, &out_shape);
+            let indices = Tensor::new(max_indices.clone(), &out_shape);
+
+            if self.requires_grad {
+                values.requires_grad = true;
+                let input = self.clone();
+                let out = values.clone();
+                let in_shape = self.shape.clone();
+                let out_shape = out_shape.clone();
+                let d = d;
+
+                Tape::push_unary_op(self, &values, move || {
+                    if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                        let mut slot = input.grad.write().unwrap();
+                        let in_size: usize = in_shape.iter().product();
+                        if slot.is_none() {
+                            *slot = Some(vec![0.0; in_size]);
+                        }
+                        let gin = slot.as_mut().unwrap();
+
+                        // For each output element, scatter gradient to the argmax position
+                        let out_size = gout.len();
+                        for oi in 0..out_size {
+                            let dim_idx = max_indices[oi] as usize;
+
+                            // Convert flat out_idx to coordinates in out_shape
+                            // Compute input strides
+                            let mut in_strides = vec![1usize; in_shape.len()];
+                            for j in (0..in_shape.len() - 1).rev() {
+                                in_strides[j] = in_strides[j + 1] * in_shape[j + 1];
+                            }
+
+                            // Compute output strides
+                            let mut out_strides = vec![1usize; out_shape.len()];
+                            for j in (0..out_shape.len() - 1).rev() {
+                                out_strides[j] = out_strides[j + 1] * out_shape[j + 1];
+                            }
+
+                            // Decompose out_idx into coords, replace dim d with argmax
+                            let mut in_flat = 0;
+                            let mut remaining = oi;
+                            for j in 0..out_shape.len() {
+                                let coord = remaining / out_strides[j];
+                                remaining %= out_strides[j];
+
+                                let in_coord = if j == d { dim_idx } else { coord };
+                                in_flat += in_coord * in_strides[j];
+                            }
+
+                            gin[in_flat] += gout[oi];
+                        }
+                    }
+                });
+            }
 
             (values, indices)
         } else {
@@ -1078,7 +1197,28 @@ impl Tensor {
                 .map(|(i, &v)| (v, i))
                 .unwrap_or((0.0, 0));
 
-            (Tensor::scalar(max_val), Tensor::scalar(max_idx as f32))
+            let mut values = Tensor::scalar(max_val);
+            let indices = Tensor::scalar(max_idx as f32);
+
+            if self.requires_grad {
+                values.requires_grad = true;
+                let input = self.clone();
+                let out = values.clone();
+                let max_idx = max_idx;
+
+                Tape::push_unary_op(self, &values, move || {
+                    if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                        let mut slot = input.grad.write().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(vec![0.0; input.data().len()]);
+                        }
+                        let gin = slot.as_mut().unwrap();
+                        gin[max_idx] += gout[0];
+                    }
+                });
+            }
+
+            (values, indices)
         }
     }
 
@@ -1385,7 +1525,7 @@ impl Tensor {
         dilation: (usize, usize),
     ) -> Tensor {
         let conv_out = self.conv2d(weight, bias, stride, padding, dilation);
-        conv_out.relu_inplace()
+        conv_out.relu()
     }
 
     pub fn max_pool2d(
@@ -1858,6 +1998,7 @@ impl Tensor {
                                                 output,
                                                 batch,
                                                 ch,
+                                                c,
                                                 h_in,
                                                 w_in,
                                                 in_h_idx,
@@ -1895,6 +2036,7 @@ impl Tensor {
                                         output,
                                         batch,
                                         ch,
+                                        c,
                                         h_in,
                                         w_in,
                                         in_h_idx,
@@ -1919,6 +2061,7 @@ impl Tensor {
         output: &mut [f32],
         batch: usize,
         ch: usize,
+        c_total: usize,
         h_in: usize,
         w_in: usize,
         in_h: usize,
@@ -1928,7 +2071,8 @@ impl Tensor {
     ) {
         if count >= 8 && in_w_start + count <= w_in {
             // Use SIMD for larger copies
-            let in_base = batch * ch * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w_start;
+            let in_base =
+                batch * c_total * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w_start;
 
             unsafe {
                 #[cfg(target_arch = "x86_64")]
@@ -1961,7 +2105,8 @@ impl Tensor {
             for i in 0..count {
                 let in_w = in_w_start + i;
                 if in_w < w_in {
-                    let in_idx = batch * ch * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w;
+                    let in_idx =
+                        batch * c_total * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w;
                     output[out_start + i] = input[in_idx];
                 }
             }
@@ -2075,11 +2220,6 @@ impl Tensor {
         Tensor::new(result_data, &new_shape)
     }
 
-    /// In-place ReLU for fusion operations
-    fn relu_inplace(self) -> Tensor {
-        self.relu()
-    }
-
     /// Quantize tensor based on configuration
     pub fn quantize(&self, config: &QuantizationConfig) -> QuantizedTensor {
         if !config.enabled {
@@ -2139,7 +2279,7 @@ impl Tensor {
             .collect();
 
         Int8Tensor {
-            data: Rc::new(RefCell::new(quantized_data)),
+            data: Arc::new(RwLock::new(quantized_data)),
             shape: self.shape.clone(),
             scale,
             zero_point,
@@ -2149,13 +2289,9 @@ impl Tensor {
 
     /// Quantize to int4 (packed representation)
     fn quantize_to_int4(&self, _config: &QuantizationConfig) -> Int4Tensor {
-        // For now, create a dummy int4 tensor
-        // TODO: Implement proper int4 quantization with packing
-        let size: usize = self.shape.iter().product();
-        let packed_size = (size + 1) / 2; // 2 int4 values per byte
-        let dummy_data = vec![0u8; packed_size];
-
-        Int4Tensor::new(dummy_data, self.shape.clone(), 1.0, 0)
+        unimplemented!(
+            "Int4 quantization not yet implemented: packing two 4-bit values per byte needed"
+        )
     }
 
     /// Convert to float16
@@ -2168,23 +2304,12 @@ impl Tensor {
 
     /// Convert to bfloat16
     fn quantize_to_bfloat16(&self) -> BFloat16Tensor {
-        // For now, create a dummy bfloat16 tensor
-        // TODO: Implement proper bfloat16 conversion
-        let size: usize = self.shape.iter().product();
-        let dummy_data = vec![0u16; size];
-
-        BFloat16Tensor::new(dummy_data, self.shape.clone())
+        unimplemented!("BFloat16 quantization not yet implemented: f32-to-bf16 conversion needed")
     }
 
     /// Quantize to NF4
     fn quantize_to_nf4(&self, _config: &QuantizationConfig) -> NF4Tensor {
-        // For now, create a dummy NF4 tensor
-        // TODO: Implement proper NF4 quantization
-        let size: usize = self.shape.iter().product();
-        let packed_size = (size + 1) / 2; // 2 NF4 values per byte
-        let dummy_data = vec![0u8; packed_size];
-
-        NF4Tensor::new(dummy_data, self.shape.clone(), 1.0, 0)
+        unimplemented!("NF4 quantization not yet implemented: NF4 lookup table and packing needed")
     }
 
     /// Convert f32 to f16 (IEEE 754 half precision)

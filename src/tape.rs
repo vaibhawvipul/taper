@@ -1,4 +1,3 @@
-use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 use crate::tensor::Tensor;
@@ -14,12 +13,11 @@ pub struct Tape {
 }
 
 struct TapeInner {
-    // Store closures as Rc so we can clone them out of the borrow and run safely.
     nodes: Vec<Node>,
 }
 
 struct Node {
-    backward_fn: Rc<dyn Fn()>,
+    backward_fn: Arc<dyn Fn()>,
 }
 
 impl Tape {
@@ -57,18 +55,16 @@ impl Tape {
         }
         Self::ensure_active();
 
-        // Take Rc out while the RefCell borrow is active, then drop it before mut borrow.
         let rc_opt = TAPE.with(|tape| tape.borrow().as_ref().cloned());
         if let Some(rc) = rc_opt {
             let id = {
                 let mut inner = rc.write().unwrap();
                 let id = inner.nodes.len();
                 inner.nodes.push(Node {
-                    backward_fn: Rc::new(backward_fn),
+                    backward_fn: Arc::new(backward_fn),
                 });
                 id
             };
-            // stamp after releasing inner borrow
             output
                 .tape_node
                 .store(id, std::sync::atomic::Ordering::SeqCst);
@@ -90,7 +86,7 @@ impl Tape {
                 let mut inner = rc.write().unwrap();
                 let id = inner.nodes.len();
                 inner.nodes.push(Node {
-                    backward_fn: Rc::new(backward_fn),
+                    backward_fn: Arc::new(backward_fn),
                 });
                 id
             };
@@ -102,10 +98,9 @@ impl Tape {
 }
 
 /// Execute backward functions up to `final_node_id` (inclusive), in reverse.
-/// We clone closures out first to avoid holding any RefCell borrows while executing.
+/// We clone closures out first to avoid holding any borrows while executing.
 pub fn backward(final_node_id: usize) {
-    // Clone the closures we’ll run (no borrows alive afterwards).
-    let fns: Vec<Rc<dyn Fn()>> = TAPE.with(|t| {
+    let fns: Vec<Arc<dyn Fn()>> = TAPE.with(|t| {
         let Some(rc) = t.borrow().as_ref().cloned() else {
             return Vec::new();
         };

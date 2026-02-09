@@ -82,19 +82,25 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
 pub fn softmax(x: &Tensor, dim: i32) -> Tensor {
     let ndim = x.shape().len() as i32;
     let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+    assert_eq!(
+        dim,
+        x.shape().len() - 1,
+        "Only last-dim softmax is supported; got dim={dim} for shape {:?}",
+        x.shape()
+    );
 
-    // Subtract max for numerical stability
+    // Subtract max for numerical stability (broadcasting: [B,C] - [B,1])
     let (max_vals, _) = x.max(Some(dim));
-    let x_shifted = x - &max_vals;
+    let x_shifted = x.sub_broadcast_rows(&max_vals);
 
     // exp(x - max(x))
     let exp_x = x_shifted.exp();
 
-    // sum(exp(x - max(x)))
+    // sum(exp(x - max(x)))  keepdim=true -> [B,1]
     let sum_exp = exp_x.sum(Some(dim), true);
 
-    // softmax = exp(x - max(x)) / sum(exp(x - max(x)))
-    &exp_x / &sum_exp
+    // softmax = exp(x - max(x)) / sum(exp(x - max(x)))  broadcasting: [B,C] / [B,1]
+    exp_x.div_broadcast_rows(&sum_exp)
 }
 
 /// Log-softmax for numerical stability in cross-entropy
