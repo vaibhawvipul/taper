@@ -2,7 +2,9 @@ pub mod activation;
 pub mod data;
 pub mod gemm;
 pub mod loss;
+pub mod models;
 pub mod nn;
+pub mod norm;
 pub mod ops;
 pub mod optim;
 pub mod quantization;
@@ -11,6 +13,7 @@ pub mod tensor;
 pub mod train;
 
 pub use gemm::{n, sgemm_rowmajor, t};
+pub use models::{ResNet, ResNetConfig};
 pub use quantization::{QATConfig, QATManager, QuantizationConfig, QuantizationType};
 pub use tape::Tape;
 pub use tensor::{QuantizedTensor, Tensor};

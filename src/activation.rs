@@ -4,6 +4,7 @@ use crate::{
 };
 
 /// ReLU activation as a module
+#[derive(Debug)]
 pub struct ReLU;
 
 impl Module for ReLU {

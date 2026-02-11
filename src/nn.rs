@@ -1,6 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use crate::{QuantizationConfig, QuantizedTensor, Tensor};
+use crate::norm::BatchNorm2d;
+use crate::activation::ReLU;
 use rand::{
     Rng,
     distributions::{Distribution, Uniform},
@@ -271,6 +273,20 @@ impl Conv2d {
             None,
             None,
             true,
+        )
+    }
+
+    /// Create a 1x1 conv layer with stride (useful for projection shortcuts)
+    pub fn conv1x1_stride(in_channels: usize, out_channels: usize, stride: usize) -> Self {
+        Self::new(
+            in_channels,
+            out_channels,
+            (1, 1),
+            Some((stride, stride)),
+            None,
+            None,
+            None,
+            false,  // No bias in projection shortcuts (ResNet standard)
         )
     }
 }
@@ -547,6 +563,7 @@ impl Module for MaxPool2d {
         vec![]
     }
 }
+
 
 /// Quantized MaxPool2d layer for inference
 pub struct QuantizedMaxPool2d {
@@ -826,32 +843,150 @@ impl Module for Dropout {
     }
 }
 
-/// Basic CNN block: Conv -> BatchNorm -> ReLU (BatchNorm will be added later)
-#[derive(Debug)]
 pub struct BasicBlock {
-    conv: Conv2d,
-    // batchnorm: BatchNorm2d, // TODO: Add when BatchNorm2d is implemented
+    conv1: Conv2d,
+    bn1: BatchNorm2d, 
+    #[allow(dead_code)]
+    relu: ReLU,
+    conv2: Conv2d, 
+    bn2: BatchNorm2d, 
+    downsample: Option<Box<dyn Module>>,
 }
 
 impl BasicBlock {
     pub fn new(in_channels: usize, out_channels: usize, stride: usize) -> Self {
         BasicBlock {
-            conv: Conv2d::conv3x3(in_channels, out_channels, stride, 1),
-            // batchnorm: BatchNorm2d::new(out_channels),
+            conv1: Conv2d::conv3x3(in_channels, out_channels, stride, 1),
+            bn1: BatchNorm2d::new(out_channels), 
+            relu: ReLU, 
+            conv2: Conv2d::conv3x3(out_channels, out_channels, 1, 1),
+            bn2: BatchNorm2d::new(out_channels), 
+            downsample: if in_channels != out_channels || stride != 1 {
+                Some(Box::new(Conv2d::conv1x1_stride(in_channels, out_channels, stride)))
+            } else {
+                None
+            }
         }
     }
 }
 
 impl Module for BasicBlock {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let out = self.conv.forward(input);
-        // let out = self.batchnorm.forward(&out); // TODO: Add when BatchNorm2d is implemented
+        let mut identity = input.clone(); 
+        let mut out = self.conv1.forward(input);
+        out = self.bn1.forward(&out); 
+        out = out.relu();  
+
+        out = self.conv2.forward(&out); 
+        out = self.bn2.forward(&out); 
+
+        if let Some(downsample) = &self.downsample {
+            identity = downsample.forward(&identity); 
+        }
+
+        out = out + identity; 
         out.relu()
     }
 
     fn parameters(&self) -> Vec<Tensor> {
-        let params = self.conv.parameters();
-        // params.extend(self.batchnorm.parameters()); // TODO: Add when BatchNorm2d is implemented
+        let mut params = Vec::new(); 
+
+        params.extend(self.conv1.parameters()); 
+        params.extend(self.bn1.parameters()); 
+
+        params.extend(self.conv2.parameters()); 
+        params.extend(self.bn2.parameters()); 
+
+        // no params for relu 
+        if let Some(downsample) = &self.downsample {
+            params.extend(downsample.parameters()); 
+        }
+
+        params
+    }
+}
+
+pub struct BottleneckBlock {
+    #[allow(dead_code)]
+    expansion_factor: usize, 
+
+    conv1: Conv2d, 
+    bn1: BatchNorm2d, 
+
+    conv2: Conv2d, 
+    bn2: BatchNorm2d, 
+
+    conv3: Conv2d, 
+    bn3: BatchNorm2d, 
+
+    #[allow(dead_code)]
+    relu: ReLU,
+    downsample: Option<Box<dyn Module>>,
+}
+
+impl BottleneckBlock {
+    pub fn new(in_channels: usize, out_channels: usize, stride: usize) -> Self {
+        let expansion = 4; 
+        let mid_channels = out_channels / expansion; 
+
+        BottleneckBlock {
+            expansion_factor: expansion,
+            conv1: Conv2d::conv1x1(in_channels, mid_channels), 
+            bn1: BatchNorm2d::new(mid_channels), 
+            
+            conv2: Conv2d::conv3x3(mid_channels, mid_channels, stride, 1), 
+            bn2: BatchNorm2d::new(mid_channels), 
+
+            conv3: Conv2d::conv1x1(mid_channels, out_channels), 
+            bn3: BatchNorm2d::new(out_channels), 
+
+            relu: ReLU, 
+            downsample: if in_channels != out_channels || stride != 1 {
+                Some(Box::new(Conv2d::conv1x1_stride(in_channels, out_channels, stride)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Module for BottleneckBlock {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let mut identity = input.clone();
+        
+        let mut out = self.conv1.forward(input);
+        out = self.bn1.forward(&out);
+        out = out.relu();
+        
+        out = self.conv2.forward(&out);
+        out = self.bn2.forward(&out);
+        out = out.relu();
+        
+        out = self.conv3.forward(&out);
+        out = self.bn3.forward(&out);
+        
+        if let Some(downsample) = &self.downsample {
+            identity = downsample.forward(&identity);
+        }
+        
+        // Add + ReLU
+        out = out + identity;
+        out.relu()
+    }
+    
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = Vec::new();
+        params.extend(self.conv1.parameters());
+        params.extend(self.bn1.parameters());
+        params.extend(self.conv2.parameters());
+        params.extend(self.bn2.parameters());
+        params.extend(self.conv3.parameters());
+        params.extend(self.bn3.parameters());
+        
+        if let Some(downsample) = &self.downsample {
+            params.extend(downsample.parameters());
+        }
+        
         params
     }
 }
@@ -1013,5 +1148,62 @@ impl Tensor {
         }
 
         Tensor::new(result_data, &out_shape)
+    }
+}
+
+/// Generic Residual/Skip Connection module
+/// Implements: output = main_path(x) + shortcut(x)
+/// Where shortcut can be identity (x) or a projection (e.g., 1x1 conv)
+pub struct Residual {
+    main_path: Box<dyn Module>,
+    shortcut: Option<Box<dyn Module>>,
+}
+
+impl std::fmt::Debug for Residual {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Residual")
+            .field("has_projection", &self.shortcut.is_some())
+            .finish()
+    }
+}
+
+impl Residual {
+    /// Create residual block with identity shortcut: output = main_path(x) + x
+    pub fn identity(main_path: Box<dyn Module>) -> Self {
+        Residual {
+            main_path,
+            shortcut: None,
+        }
+    }
+
+    /// Create residual block with projection shortcut: output = main_path(x) + shortcut(x)
+    /// Use this when input/output dimensions don't match
+    pub fn with_projection(main_path: Box<dyn Module>, shortcut: Box<dyn Module>) -> Self {
+        Residual {
+            main_path,
+            shortcut: Some(shortcut),
+        }
+    }
+}
+
+impl Module for Residual {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let main_out = self.main_path.forward(input);
+        
+        let skip_out = match &self.shortcut {
+            Some(projection) => projection.forward(input),
+            None => input.clone(),
+        };
+        
+        // Element-wise addition with autograd support
+        main_out + skip_out
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = self.main_path.parameters();
+        if let Some(proj) = &self.shortcut {
+            params.extend(proj.parameters());
+        }
+        params
     }
 }
