@@ -50,6 +50,8 @@ mod imp {
         }
     }
 
+    pub type TransFlag = CBLAS_TRANSPOSE;
+
     #[inline]
     pub fn n() -> CBLAS_TRANSPOSE {
         CBLAS_TRANSPOSE::CblasNoTrans
@@ -120,6 +122,8 @@ mod imp {
         }
     }
 
+    pub type TransFlag = Trans;
+
     #[inline]
     pub fn n() -> Trans {
         Trans::N
@@ -130,4 +134,4 @@ mod imp {
     }
 }
 
-pub use imp::{n, sgemm_rowmajor, t};
+pub use imp::{TransFlag, n, sgemm_rowmajor, t};

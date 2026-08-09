@@ -1,6 +1,23 @@
-use crate::gemm::{n as no_trans, sgemm_rowmajor, t as trans};
+use crate::gemm::{TransFlag, n as no_trans, sgemm_rowmajor, t as trans};
+use crate::tensor::GemmLayout;
 use crate::{Tensor, tape::Tape};
 use std::ops::{Add, Div, Mul, Sub};
+
+/// The GEMM trans flag that makes `operand` present as `op(X) = Xᵀ` when
+/// `want_transpose`, or as `X` otherwise.
+///
+/// A tensor stored transposed already *is* its own transpose in memory, so the
+/// two conditions cancel: the flag is `T` exactly when they disagree. This one
+/// rule covers the forward product and both backward products.
+#[inline]
+fn trans_flag(operand: &Tensor, want_transpose: bool) -> TransFlag {
+    let stored_transposed = matches!(operand.gemm_layout_2d(), Some(GemmLayout::Transposed));
+    if stored_transposed != want_transpose {
+        trans()
+    } else {
+        no_trans()
+    }
+}
 
 // Import the SIMD utilities from tensor module
 use crate::tensor::simd;
@@ -10,12 +27,8 @@ impl Add for &Tensor {
     fn add(self, other: &Tensor) -> Tensor {
         assert_same_shape(self, other, "add");
 
-        // Clone data ONCE at the start
-        let (a_data, b_data) = {
-            let a = self.data();
-            let b = other.data();
-            (a.clone(), b.clone())
-        };
+        let a_data = self.elements();
+        let b_data = other.elements();
         let mut out_data = vec![0.0; a_data.len()];
 
         // Use SIMD operations
@@ -54,8 +67,8 @@ impl Mul for &Tensor {
     fn mul(self, other: &Tensor) -> Tensor {
         assert_same_shape(self, other, "mul");
 
-        let self_data = self.data();
-        let other_data = other.data();
+        let self_data = self.elements();
+        let other_data = other.elements();
         let mut out_data = vec![0.0; self_data.len()];
 
         // Use SIMD operations
@@ -77,7 +90,7 @@ impl Mul for &Tensor {
                     // gradient from the *other* operand's data and round-trip
                     // through two scratch buffers; fold it into one pass.
                     if a.requires_grad {
-                        let bdat = b.data();
+                        let bdat = b.elements();
                         let mut slot = a.grad.write().expect("grad RwLock poisoned");
                         let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
                         for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
@@ -85,7 +98,7 @@ impl Mul for &Tensor {
                         }
                     }
                     if b.requires_grad {
-                        let adat = a.data();
+                        let adat = a.elements();
                         let mut slot = b.grad.write().expect("grad RwLock poisoned");
                         let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
                         for ((g, &go), &av) in gb.iter_mut().zip(gout.iter()).zip(adat.iter()) {
@@ -204,23 +217,31 @@ impl Tensor {
         let n_out = other.shape[1] as i32;
         assert_eq!(k, k2, "Inner dimensions must match: {} vs {}", k, k2);
 
-        let a = self.data();
-        let b = other.data();
+        // A transposed view is already the layout BLAS wants under its trans
+        // flag, so it feeds straight in — no materialization. Anything with a
+        // layout GEMM can't address (a strided sub-window) is packed first.
+        let a = self.packed_operand();
+        let b = other.packed_operand();
+
+        let a_store = a.storage();
+        let b_store = b.storage();
         let mut c = vec![0.0f32; (m * n_out) as usize];
 
         // Forward: C = A * B
         sgemm_rowmajor(
-            no_trans(),
-            no_trans(),
+            trans_flag(&a, false),
+            trans_flag(&b, false),
             m,
             n_out,
             k,
             1.0,
-            &a[..],
-            &b[..],
+            &a_store[a.offset..],
+            &b_store[b.offset..],
             0.0,
             &mut c,
         );
+        drop(a_store);
+        drop(b_store);
 
         let mut out = Tensor::new(c, &[m as usize, n_out as usize]);
 
@@ -242,21 +263,21 @@ impl Tensor {
                         let k = a_shape[1] as i32;
                         let n_out = b_shape[1] as i32;
 
-                        let bdat = b_t.data();
-                        let mut slot = a_t.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; (m * k) as usize]);
-                        }
-                        let ga = slot.as_mut().unwrap();
+                        // Gradients are always dense row-major, so only the
+                        // operand read out of the graph needs a layout flag.
+                        let b_op = b_t.packed_operand();
+                        let b_store = b_op.storage();
+                        let mut slot = a_t.grad.write().expect("grad RwLock poisoned");
+                        let ga = slot.get_or_insert_with(|| vec![0.0; (m * k) as usize]);
                         sgemm_rowmajor(
                             no_trans(),
-                            trans(),
+                            trans_flag(&b_op, true),
                             m,
                             k,
                             n_out,
                             1.0,
                             gout,
-                            &bdat[..],
+                            &b_store[b_op.offset..],
                             1.0,
                             ga,
                         );
@@ -268,20 +289,18 @@ impl Tensor {
                         let n_out = b_shape[1] as i32;
                         let m = a_shape[0] as i32;
 
-                        let adat = a_t.data();
-                        let mut slot = b_t.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; (kdim * n_out) as usize]);
-                        }
-                        let gb = slot.as_mut().unwrap();
+                        let a_op = a_t.packed_operand();
+                        let a_store = a_op.storage();
+                        let mut slot = b_t.grad.write().expect("grad RwLock poisoned");
+                        let gb = slot.get_or_insert_with(|| vec![0.0; (kdim * n_out) as usize]);
                         sgemm_rowmajor(
-                            trans(),
+                            trans_flag(&a_op, true),
                             no_trans(),
                             kdim,
                             n_out,
                             m,
                             1.0,
-                            &adat[..],
+                            &a_store[a_op.offset..],
                             gout,
                             1.0,
                             gb,
@@ -307,7 +326,7 @@ impl Tensor {
 
     /// SIMD-optimized ReLU activation
     pub fn relu(&self) -> Tensor {
-        let data = self.data();
+        let data = self.elements();
         let mut result = vec![0.0; data.len()];
 
         // SIMD ReLU using max with zero
@@ -376,8 +395,8 @@ impl Sub for &Tensor {
     fn sub(self, other: &Tensor) -> Tensor {
         assert_same_shape(self, other, "sub");
 
-        let self_data = self.data();
-        let other_data = other.data();
+        let self_data = self.elements();
+        let other_data = other.elements();
         let mut out_data = vec![0.0; self_data.len()];
 
         // Subtract using SIMD - we can reuse add with negation
@@ -435,8 +454,8 @@ impl Div for &Tensor {
     fn div(self, other: &Tensor) -> Tensor {
         assert_same_shape(self, other, "div");
 
-        let self_data = self.data();
-        let other_data = other.data();
+        let self_data = self.elements();
+        let other_data = other.elements();
         let mut out_data = vec![0.0; self_data.len()];
 
         // Element-wise division
@@ -456,7 +475,7 @@ impl Div for &Tensor {
                 if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
                     // d/da (a/b) = 1/b, d/db (a/b) = -a/b²
                     if a.requires_grad {
-                        let bdat = b.data();
+                        let bdat = b.elements();
                         let mut slot = a.grad.write().expect("grad RwLock poisoned");
                         let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
                         for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
@@ -464,8 +483,8 @@ impl Div for &Tensor {
                         }
                     }
                     if b.requires_grad {
-                        let adat = a.data();
-                        let bdat = b.data();
+                        let adat = a.elements();
+                        let bdat = b.elements();
                         let mut slot = b.grad.write().expect("grad RwLock poisoned");
                         let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
                         for (((g, &go), &av), &bv) in gb

@@ -5,8 +5,8 @@ use crate::{Tensor, ops};
 /// L = -mean( y*log(p) + (1-y)*log(1-p) )
 pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
     let eps: f32 = 1e-7;
-    let p = predictions.data();
-    let t = targets.data();
+    let p = predictions.elements();
+    let t = targets.elements();
     assert_eq!(
         p.len(),
         t.len(),
@@ -35,8 +35,8 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
             if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
                 let g = gout[0]; // scalar chain multiplier from upstream
 
-                let pdat = preds.data();
-                let tdat = targs.data();
+                let pdat = preds.elements();
+                let tdat = targs.elements();
 
                 // dL/dp_i = -( y/p - (1-y)/(1-p) ) / N
                 if preds.requires_grad {
@@ -157,8 +157,8 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Tensor {
 
     // log p = log_softmax(logits)
     let logp = log_softmax(logits, -1);
-    let lp = logp.data();
-    let t = targets.data();
+    let lp = logp.elements();
+    let t = targets.elements();
 
     // NLL loss (mean)
     let mut acc = 0.0f32;
