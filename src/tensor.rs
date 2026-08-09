@@ -4,8 +4,6 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
 use rayon::prelude::*;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 use std::sync::{Arc, RwLock};
 
 // SIMD utility module for cross-platform support
@@ -75,10 +73,11 @@ pub mod simd {
         let chunks = a.len() / 8;
         for i in 0..chunks {
             let idx = i * 8;
-            let va = _mm256_loadu_ps(a.as_ptr().add(idx));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
-            let result = _mm256_add_ps(va, vb);
-            _mm256_storeu_ps(out.as_mut_ptr().add(idx), result);
+            unsafe {
+                let va = _mm256_loadu_ps(a.as_ptr().add(idx));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
+                _mm256_storeu_ps(out.as_mut_ptr().add(idx), _mm256_add_ps(va, vb));
+            }
         }
         // Handle remainder
         for i in (chunks * 8)..a.len() {
@@ -92,10 +91,11 @@ pub mod simd {
         let chunks = a.len() / 4;
         for i in 0..chunks {
             let idx = i * 4;
-            let va = _mm_loadu_ps(unsafe { a.as_ptr().add(idx) });
-            let vb = _mm_loadu_ps(unsafe { b.as_ptr().add(idx) });
-            let result = _mm_add_ps(va, vb);
-            _mm_storeu_ps(unsafe { out.as_mut_ptr().add(idx) }, result);
+            unsafe {
+                let va = _mm_loadu_ps(a.as_ptr().add(idx));
+                let vb = _mm_loadu_ps(b.as_ptr().add(idx));
+                _mm_storeu_ps(out.as_mut_ptr().add(idx), _mm_add_ps(va, vb));
+            }
         }
         // Handle remainder
         for i in (chunks * 4)..a.len() {
@@ -170,10 +170,11 @@ pub mod simd {
         let chunks = a.len() / 8;
         for i in 0..chunks {
             let idx = i * 8;
-            let va = _mm256_loadu_ps(a.as_ptr().add(idx));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
-            let result = _mm256_mul_ps(va, vb);
-            _mm256_storeu_ps(out.as_mut_ptr().add(idx), result);
+            unsafe {
+                let va = _mm256_loadu_ps(a.as_ptr().add(idx));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
+                _mm256_storeu_ps(out.as_mut_ptr().add(idx), _mm256_mul_ps(va, vb));
+            }
         }
         for i in (chunks * 8)..a.len() {
             out[i] = a[i] * b[i];
@@ -186,10 +187,11 @@ pub mod simd {
         let chunks = a.len() / 4;
         for i in 0..chunks {
             let idx = i * 4;
-            let va = _mm_loadu_ps(unsafe { a.as_ptr().add(idx) });
-            let vb = _mm_loadu_ps(unsafe { b.as_ptr().add(idx) });
-            let result = _mm_mul_ps(va, vb);
-            _mm_storeu_ps(unsafe { out.as_mut_ptr().add(idx) }, result);
+            unsafe {
+                let va = _mm_loadu_ps(a.as_ptr().add(idx));
+                let vb = _mm_loadu_ps(b.as_ptr().add(idx));
+                _mm_storeu_ps(out.as_mut_ptr().add(idx), _mm_mul_ps(va, vb));
+            }
         }
         for i in (chunks * 4)..a.len() {
             out[i] = a[i] * b[i];

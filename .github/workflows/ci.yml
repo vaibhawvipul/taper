@@ -7,20 +7,40 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `.cargo/config.toml` sets `-C target-cpu=native`, which is right for local
-  # benchmarking but bakes host-specific instructions into CI artifacts.
-  RUSTFLAGS: "-D warnings"
 
 jobs:
+  # The SIMD kernels are #[cfg]-gated per architecture and per target-feature,
+  # so a single runner only ever compiles one of them. Each entry below is the
+  # only place its kernel gets type-checked and linted at all.
   check:
-    name: fmt / clippy / test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64 (sse)
+            os: ubuntu-latest
+            flags: ""
+          - name: x86_64 (avx+fma)
+            os: ubuntu-latest
+            flags: "-C target-feature=+avx,+fma"
+          - name: aarch64 (neon)
+            os: macos-latest
+            flags: ""
+    env:
+      # Setting RUSTFLAGS replaces `.cargo/config.toml`'s `[build] rustflags`,
+      # which is what we want: `-C target-cpu=native` is right for local
+      # benchmarking but bakes host-specific instructions into CI artifacts.
+      RUSTFLAGS: "-D warnings ${{ matrix.flags }}"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -37,11 +57,19 @@ jobs:
   blas:
     name: openblas backend
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: openblas
       - name: Install OpenBLAS
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev gfortran
-      - name: Build and test with BLAS
+      - name: Clippy
+        run: cargo clippy --features blas-openblas --all-targets -- -D warnings
+      - name: Test
         run: cargo test --features blas-openblas --all-targets
