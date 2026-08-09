@@ -88,10 +88,17 @@ fn grouped_conv_reaches_its_weights() {
         .weight
         .grad_ref()
         .expect("grouped conv produced no weight gradient");
-    assert!(
-        wgrad.iter().any(|g| g.abs() > 1e-6),
-        "weight gradient is all zeros"
-    );
+    // Per group, not "any element anywhere": `cat` once declared only its first
+    // input as a dependency, so group 0's gradients satisfied an `any` check
+    // while every later group stayed silently at zero.
+    let per_group = wgrad.len() / 2;
+    for g in 0..2 {
+        let span = &wgrad[g * per_group..(g + 1) * per_group];
+        assert!(
+            span.iter().any(|v| v.abs() > 1e-6),
+            "group {g} received no weight gradient"
+        );
+    }
     assert!(
         input
             .grad_ref()

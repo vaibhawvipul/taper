@@ -9,6 +9,7 @@ use blas_src as _;
 pub mod activation;
 pub mod data;
 pub mod gemm;
+pub mod gradcheck;
 pub mod loss;
 pub mod nn;
 pub mod norm;
