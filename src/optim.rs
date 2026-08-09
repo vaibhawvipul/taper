@@ -119,9 +119,9 @@ impl Adam {
         let weight_decay = weight_decay.unwrap_or(0.0);
 
         // Initialize moment buffers
-        let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.data().len()]).collect();
+        let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
 
-        let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.data().len()]).collect();
+        let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
 
         Adam {
             params,

@@ -854,7 +854,7 @@ impl Module for Dropout {
         }
 
         if self.p == 1.0 {
-            return Tensor::new(vec![0.0; input.data().len()], input.shape());
+            return Tensor::new(vec![0.0; input.numel()], input.shape());
         }
 
         // Create dropout mask
@@ -884,39 +884,6 @@ impl Module for Dropout {
 
 // Helper implementations for tensor operations needed by grouped convolution
 impl Tensor {
-    /// Gather `indices` (flat positions into this tensor) into a new tensor of
-    /// `out_shape`, recording a scatter-add backward edge.
-    ///
-    /// All the slicing helpers below reduce to this. Previously they built
-    /// their outputs with a bare `Tensor::new`, which left grouped convolution
-    /// with no path back to its weights: `Conv2d` with `groups > 1` trained
-    /// forever without ever updating a parameter.
-    fn gather_flat(&self, indices: Vec<usize>, out_shape: &[usize]) -> Tensor {
-        let data = self.data();
-        let result_data: Vec<f32> = indices.iter().map(|&i| data[i]).collect();
-        drop(data);
-
-        let mut output = Tensor::new(result_data, out_shape);
-
-        if self.requires_grad {
-            output.requires_grad = true;
-            let input = self.clone();
-            let out = output.clone();
-
-            crate::tape::Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
-                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
-                    let gin = slot.get_or_insert_with(|| vec![0.0; input.numel()]);
-                    for (&src_idx, &g) in indices.iter().zip(gout.iter()) {
-                        gin[src_idx] += g;
-                    }
-                }
-            });
-        }
-
-        output
-    }
-
     /// Extract a slice of channels from a 4D tensor
     pub fn slice_channels(&self, start: usize, end: usize) -> Tensor {
         assert_eq!(
@@ -926,18 +893,7 @@ impl Tensor {
         );
         assert!(start < end && end <= self.shape[1], "Invalid channel range");
 
-        let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let c_slice = end - start;
-
-        let mut indices = Vec::with_capacity(n * c_slice * h * w);
-        for batch in 0..n {
-            for ch in start..end {
-                let base_idx = batch * c * h * w + ch * h * w;
-                indices.extend(base_idx..base_idx + h * w);
-            }
-        }
-
-        self.gather_flat(indices, &[n, c_slice, h, w])
+        self.narrow(1, start, end - start)
     }
 
     /// Extract output channels from weight tensor
@@ -952,13 +908,7 @@ impl Tensor {
             "Invalid output channel range"
         );
 
-        let (_c_out, c_in, k_h, k_w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let c_out_slice = end - start;
-        let per_filter = c_in * k_h * k_w;
-
-        let indices: Vec<usize> = (start * per_filter..end * per_filter).collect();
-
-        self.gather_flat(indices, &[c_out_slice, c_in, k_h, k_w])
+        self.narrow(0, start, end - start)
     }
 
     /// Extract slice from 1D tensor (for bias)
@@ -966,7 +916,7 @@ impl Tensor {
         assert_eq!(self.shape.len(), 1, "slice_1d only works on 1D tensors");
         assert!(start < end && end <= self.shape[0], "Invalid range");
 
-        self.gather_flat((start..end).collect(), &[end - start])
+        self.narrow(0, start, end - start)
     }
 
     /// Concatenate tensors along specified dimension
@@ -1019,7 +969,7 @@ impl Tensor {
         for o in 0..outer {
             for (ti, tensor) in tensors.iter().enumerate() {
                 let block = tensor.shape[dim] * inner;
-                let data = tensor.data();
+                let data = tensor.elements();
                 let start = o * block;
                 for &v in &data[start..start + block] {
                     source_positions[ti].push(result_data.len());

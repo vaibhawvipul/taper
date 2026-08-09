@@ -265,12 +265,56 @@ pub mod simd {
 
 #[derive(Clone)]
 pub struct Tensor {
+    /// Flat backing buffer. Several tensors may share one storage: a view is a
+    /// different (shape, stride, offset) window onto the same allocation.
     // Use RwLock for read-heavy workloads (most operations read data)
     data: Arc<RwLock<Vec<f32>>>,
     pub(crate) shape: SmallVec<[usize; 4]>,
+    /// Elements to skip in `data` per step along each dimension.
+    pub(crate) stride: SmallVec<[usize; 4]>,
+    /// Index in `data` of this tensor's first logical element.
+    pub(crate) offset: usize,
     pub grad: Arc<RwLock<Option<Vec<f32>>>>,
     pub requires_grad: bool,
     pub tape_node: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A tensor's logical elements as a flat slice.
+///
+/// Borrows the backing storage when the tensor is dense (the overwhelmingly
+/// common case, and free), and materializes only for a genuine view.
+pub enum Elements<'a> {
+    Borrowed(RwLockReadGuard<'a, Vec<f32>>),
+    Owned(Vec<f32>),
+}
+
+impl std::ops::Deref for Elements<'_> {
+    type Target = [f32];
+    #[inline]
+    fn deref(&self) -> &[f32] {
+        match self {
+            Elements::Borrowed(guard) => guard,
+            Elements::Owned(v) => v,
+        }
+    }
+}
+
+/// How a 2D tensor's memory maps onto a GEMM operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmLayout {
+    /// Dense row-major: element `(i, j)` at `i * cols + j`.
+    RowMajor,
+    /// Dense column-major, i.e. a transposed view of a row-major matrix.
+    Transposed,
+}
+
+/// Row-major strides for a densely packed tensor of this shape.
+pub(crate) fn contiguous_strides(shape: &[usize]) -> SmallVec<[usize; 4]> {
+    let mut strides: SmallVec<[usize; 4]> = smallvec::smallvec![1; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
 }
 
 /// Quantized tensor that can hold different precision types
@@ -575,6 +619,8 @@ impl Tensor {
         );
         Tensor {
             data: Arc::new(RwLock::new(data)),
+            stride: contiguous_strides(shape),
+            offset: 0,
             shape: shape.iter().cloned().collect(),
             grad: Arc::new(RwLock::new(None)),
             requires_grad: false,
@@ -585,6 +631,222 @@ impl Tensor {
     /// Total number of elements.
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    /// Elements to skip in the backing storage per step along each dimension.
+    pub fn stride(&self) -> &[usize] {
+        &self.stride
+    }
+
+    /// Whether the logical elements are densely packed in row-major order.
+    ///
+    /// Note this is about *layout*: a contiguous tensor can still be a window
+    /// into a larger storage (non-zero `offset`), which is why the raw-slice
+    /// accessors additionally require [`Tensor::owns_whole_storage`].
+    pub fn is_contiguous(&self) -> bool {
+        self.stride == contiguous_strides(&self.shape)
+    }
+
+    /// Whether this tensor spans its entire backing buffer, so the raw slice
+    /// from `data()` is exactly its logical elements in order.
+    fn owns_whole_storage(&self) -> bool {
+        self.offset == 0
+            && self.is_contiguous()
+            && self.data.read().expect("data RwLock poisoned").len() == self.numel()
+    }
+
+    /// Build a view: a new tensor sharing this one's storage under a different
+    /// layout. Shares no gradient state — the caller records the backward edge.
+    fn view_with(
+        &self,
+        shape: SmallVec<[usize; 4]>,
+        stride: SmallVec<[usize; 4]>,
+        offset: usize,
+    ) -> Tensor {
+        debug_assert_eq!(shape.len(), stride.len(), "view: rank mismatch");
+        Tensor {
+            data: Arc::clone(&self.data),
+            shape,
+            stride,
+            offset,
+            grad: Arc::new(RwLock::new(None)),
+            requires_grad: false,
+            tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(crate::tape::NO_NODE)),
+        }
+    }
+
+    /// The backing storage without the layout checks `data()` performs.
+    /// Callers must account for `offset` and `stride` themselves.
+    #[inline]
+    pub(crate) fn storage(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+        self.data.read().expect("data RwLock poisoned")
+    }
+
+    /// How a 2D tensor maps onto a GEMM operand, if it maps at all.
+    ///
+    /// Only *dense* layouts qualify: `sgemm_rowmajor` derives the leading
+    /// dimension from the logical shape, so a strided sub-window (whose leading
+    /// dimension exceeds its row length) has to be materialized instead.
+    pub(crate) fn gemm_layout_2d(&self) -> Option<GemmLayout> {
+        if self.shape.len() != 2 {
+            return None;
+        }
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        if self.stride[0] == cols && self.stride[1] == 1 {
+            Some(GemmLayout::RowMajor)
+        } else if self.stride[0] == 1 && self.stride[1] == rows {
+            Some(GemmLayout::Transposed)
+        } else {
+            None
+        }
+    }
+
+    /// This tensor's logical elements as a flat slice, valid for any layout.
+    ///
+    /// This is the read path ops should use: `data()` is only correct for dense
+    /// tensors, and `to_vec()` always copies. Prefer this over both.
+    #[inline]
+    pub fn elements(&self) -> Elements<'_> {
+        if self.owns_whole_storage() {
+            Elements::Borrowed(self.data.read().expect("data RwLock poisoned"))
+        } else {
+            Elements::Owned(self.to_vec())
+        }
+    }
+
+    /// A contiguous run of `len` entries along `dim`, as a view.
+    ///
+    /// Every slicing helper reduces to this: taking a window along one axis
+    /// only moves the start offset and shortens that axis's extent, leaving all
+    /// strides untouched.
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Tensor {
+        assert!(
+            dim < self.shape.len(),
+            "narrow: dim {dim} out of range for shape {:?}",
+            self.shape
+        );
+        assert!(
+            start + len <= self.shape[dim],
+            "narrow: [{start}, {}) out of range for dim {dim} of length {}",
+            start + len,
+            self.shape[dim]
+        );
+
+        let mut shape = self.shape.clone();
+        shape[dim] = len;
+        let mut output = self.view_with(
+            shape.clone(),
+            self.stride.clone(),
+            self.offset + start * self.stride[dim],
+        );
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+            let base_shape = self.shape.clone();
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    let base_strides = contiguous_strides(&base_shape);
+                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let gin = slot.get_or_insert_with(|| vec![0.0; base_shape.iter().product()]);
+
+                    // Walk the window's logical positions, shifting the sliced
+                    // axis back by `start` to land on the base's index.
+                    let ndim = shape.len();
+                    let mut index = vec![0usize; ndim];
+                    for &g in gout.iter() {
+                        let mut base_flat = 0;
+                        for (d, &coord) in index.iter().enumerate() {
+                            let coord = if d == dim { coord + start } else { coord };
+                            base_flat += coord * base_strides[d];
+                        }
+                        gin[base_flat] += g;
+
+                        for d in (0..ndim).rev() {
+                            index[d] += 1;
+                            if index[d] < shape[d] {
+                                break;
+                            }
+                            index[d] = 0;
+                        }
+                    }
+                }
+            });
+        }
+
+        output
+    }
+
+    /// This tensor in a layout GEMM can address, packing only if necessary.
+    ///
+    /// Unlike [`Tensor::contiguous`] this records no backward edge, because the
+    /// caller accumulates gradients into the *original* tensor directly.
+    pub(crate) fn packed_operand(&self) -> Tensor {
+        match self.gemm_layout_2d() {
+            Some(_) => self.clone(),
+            None => Tensor::new(self.to_vec(), &self.shape),
+        }
+    }
+
+    /// This tensor's logical elements in row-major order.
+    ///
+    /// Walks the strides, so it is correct for any view; the contiguous case
+    /// short-circuits to a plain clone.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let storage = self.data.read().expect("data RwLock poisoned");
+        if self.offset == 0 && self.is_contiguous() && storage.len() == self.numel() {
+            return storage.clone();
+        }
+
+        let n = self.numel();
+        let mut out = Vec::with_capacity(n);
+        let ndim = self.shape.len();
+        let mut index = vec![0usize; ndim];
+        let mut cursor = self.offset;
+
+        // Odometer walk: advance the fastest-varying dimension, carrying over.
+        for _ in 0..n {
+            out.push(storage[cursor]);
+            for d in (0..ndim).rev() {
+                index[d] += 1;
+                cursor += self.stride[d];
+                if index[d] < self.shape[d] {
+                    break;
+                }
+                cursor -= self.stride[d] * self.shape[d];
+                index[d] = 0;
+            }
+        }
+        out
+    }
+
+    /// A densely packed tensor with the same logical contents.
+    ///
+    /// Free (shares storage) when already contiguous; otherwise materializes
+    /// and records an identity backward edge, since both sides are indexed in
+    /// the same logical order.
+    pub fn contiguous(&self) -> Tensor {
+        if self.owns_whole_storage() {
+            return self.clone();
+        }
+
+        let mut output = Tensor::new(self.to_vec(), &self.shape);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    ops::accumulate_grad(&input, gout);
+                }
+            });
+        }
+
+        output
     }
 
     pub fn scalar(value: f32) -> Self {
@@ -600,13 +862,40 @@ impl Tensor {
         &self.shape
     }
 
+    /// The raw backing slice, valid to index linearly.
+    ///
+    /// # Panics
+    /// If this tensor is a view — a strided or offset window onto a larger
+    /// storage — where linear indexing would silently read the wrong elements.
+    /// Call [`Tensor::to_vec`] for the logical contents of any layout, or
+    /// [`Tensor::contiguous`] to materialize first.
+    ///
+    /// This is a hard assert rather than a `debug_assert` on purpose: reading a
+    /// view as if it were dense produces plausible wrong numbers, which is the
+    /// failure mode this library can least afford.
     #[inline]
     pub fn data(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+        assert!(
+            self.owns_whole_storage(),
+            "data() on a non-contiguous view (shape {:?}, stride {:?}, offset {}); \
+             use to_vec() or contiguous()",
+            self.shape,
+            self.stride,
+            self.offset
+        );
         self.data.read().expect("data RwLock poisoned")
     }
 
+    /// Mutable access to the raw backing slice. Same restriction as [`Tensor::data`].
     #[inline]
     pub fn data_mut(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
+        assert!(
+            self.owns_whole_storage(),
+            "data_mut() on a non-contiguous view (shape {:?}, stride {:?}, offset {})",
+            self.shape,
+            self.stride,
+            self.offset
+        );
         self.data.write().expect("data RwLock poisoned")
     }
 
@@ -638,7 +927,9 @@ impl Tensor {
     }
 
     pub fn backward(&self) {
-        let ones = vec![1.0; self.data().len()];
+        // Gradients are sized by logical element count, which for a view is not
+        // the length of its (shared, possibly larger) backing storage.
+        let ones = vec![1.0; self.numel()];
         *self.grad.write().expect("grad RwLock poisoned") = Some(ones);
 
         // `NO_NODE` (not 0) marks a tensor that is not the output of a recorded
@@ -650,30 +941,22 @@ impl Tensor {
         *self.grad.write().expect("grad RwLock poisoned") = None;
     }
 
-    /// Cache-friendly blocked transpose
+    /// Transpose a 2D tensor. This is a view: it swaps the shape and stride
+    /// metadata and copies nothing.
+    ///
+    /// `Linear::forward` transposes its weight on every call, which previously
+    /// meant a full blocked copy of the weight matrix per forward pass.
     pub fn transpose(&self) -> Tensor {
         assert_eq!(self.shape.len(), 2, "Can only transpose 2D tensors");
 
         let rows = self.shape[0];
         let cols = self.shape[1];
-        let data = self.data().clone(); // Clone once, no more locks
-        let mut result = vec![0.0; data.len()];
-        let block_size = 16; // Optimal for most cache sizes
 
-        for i0 in (0..rows).step_by(block_size) {
-            for j0 in (0..cols).step_by(block_size) {
-                let i_max = (i0 + block_size).min(rows);
-                let j_max = (j0 + block_size).min(cols);
-
-                for i in i0..i_max {
-                    for j in j0..j_max {
-                        result[j * rows + i] = data[i * cols + j];
-                    }
-                }
-            }
-        }
-
-        let mut output = Tensor::new(result, &[cols, rows]);
+        let mut output = self.view_with(
+            smallvec::smallvec![cols, rows],
+            smallvec::smallvec![self.stride[1], self.stride[0]],
+            self.offset,
+        );
 
         if self.requires_grad {
             output.requires_grad = true;
@@ -702,7 +985,7 @@ impl Tensor {
 
     /// SIMD-optimized sigmoid using fast approximation
     pub fn sigmoid(&self) -> Tensor {
-        let data = self.data().clone();
+        let data = self.elements();
         let mut result = vec![0.0; data.len()];
 
         // Fast sigmoid approximation: σ(x) ≈ 0.5 + 0.5 * tanh(0.5 * x)
@@ -955,7 +1238,7 @@ impl Tensor {
     }
 
     pub fn mean(&self) -> Tensor {
-        let data = self.data();
+        let data = self.elements();
         let sum: f32 = data.iter().sum();
         let mean_val = sum / data.len() as f32;
 
@@ -972,7 +1255,7 @@ impl Tensor {
                     let g_each = gout[0] / n;
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
-                        *slot = Some(vec![0.0; input.data().len()]);
+                        *slot = Some(vec![0.0; input.numel()]);
                     }
                     for gi in slot.as_mut().unwrap().iter_mut() {
                         *gi += g_each;
@@ -984,20 +1267,30 @@ impl Tensor {
         output
     }
 
-    /// Reshape tensor to new shape (must have same total elements)
+    /// Reshape tensor to new shape (must have same total elements).
+    ///
+    /// Free for a contiguous tensor — only the shape and stride metadata
+    /// change. A non-contiguous view has to be packed first, since its logical
+    /// order is not the order its elements sit in memory.
     pub fn reshape(&self, shape: &[usize]) -> Tensor {
         let total_elements: usize = shape.iter().product();
         assert_eq!(
-            self.data().len(),
+            self.numel(),
             total_elements,
             "Cannot reshape tensor of size {} to shape {:?}",
-            self.data().len(),
+            self.numel(),
             shape
         );
 
-        // Reshaping doesn't change data, just the view
-        let data = self.data().clone();
-        let mut output = Tensor::new(data, shape);
+        let mut output = if self.is_contiguous() {
+            self.view_with(
+                shape.iter().copied().collect(),
+                contiguous_strides(shape),
+                self.offset,
+            )
+        } else {
+            Tensor::new(self.to_vec(), shape)
+        };
 
         if self.requires_grad {
             output.requires_grad = true;
@@ -1073,7 +1366,7 @@ impl Tensor {
 
     /// Sum over dimensions
     pub fn sum(&self, dim: Option<usize>, keepdim: bool) -> Tensor {
-        let data = self.data();
+        let data = self.elements();
 
         if let Some(d) = dim {
             assert!(d < self.shape.len(), "Dimension {} out of bounds", d);
@@ -1134,7 +1427,7 @@ impl Tensor {
                     if let Some(gout) = out.grad.read().unwrap().as_ref() {
                         let mut slot = input.grad.write().unwrap();
                         if slot.is_none() {
-                            *slot = Some(vec![0.0; input.data().len()]);
+                            *slot = Some(vec![0.0; input.numel()]);
                         }
                         let gin = slot.as_mut().unwrap();
 
@@ -1199,7 +1492,7 @@ impl Tensor {
 
     /// Max over dimensions, returns (values, indices)
     pub fn max(&self, dim: Option<usize>) -> (Tensor, Tensor) {
-        let data = self.data();
+        let data = self.elements();
 
         if let Some(d) = dim {
             assert!(d < self.shape.len(), "Dimension {} out of bounds", d);
@@ -1320,7 +1613,7 @@ impl Tensor {
                     if let Some(gout) = out.grad.read().unwrap().as_ref() {
                         let mut slot = input.grad.write().unwrap();
                         if slot.is_none() {
-                            *slot = Some(vec![0.0; input.data().len()]);
+                            *slot = Some(vec![0.0; input.numel()]);
                         }
                         let gin = slot.as_mut().unwrap();
                         gin[max_idx] += gout[0];
@@ -1339,7 +1632,7 @@ impl Tensor {
 
     /// Exponential function (SIMD optimized)
     pub fn exp(&self) -> Tensor {
-        let data = self.data().clone();
+        let data = self.elements();
         let mut result = vec![0.0; data.len()];
 
         // SIMD exp using approximation for better performance
@@ -1384,7 +1677,7 @@ impl Tensor {
 
     /// Natural logarithm
     pub fn log(&self) -> Tensor {
-        let data = self.data();
+        let data = self.elements();
         let mut result = vec![0.0; data.len()];
 
         for (i, &x) in data.iter().enumerate() {
@@ -1401,7 +1694,7 @@ impl Tensor {
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx ln(x) = 1/x
-                    let x = input.data();
+                    let x = input.elements();
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; x.len()]);
@@ -1420,7 +1713,7 @@ impl Tensor {
 
     /// Power function
     pub fn pow(&self, exp: f32) -> Tensor {
-        let data = self.data();
+        let data = self.elements();
         let mut result = vec![0.0; data.len()];
 
         for (i, &x) in data.iter().enumerate() {
@@ -1437,7 +1730,7 @@ impl Tensor {
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out.grad.read().unwrap().as_ref() {
                     // d/dx x^n = n * x^(n-1)
-                    let x = input.data();
+                    let x = input.elements();
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
                         *slot = Some(vec![0.0; x.len()]);
@@ -1565,7 +1858,7 @@ impl Tensor {
         let out_spatial = h_out * w_out;
 
         // read-only input slice (hold the guard just to obtain a slice, then drop it)
-        let data_guard = self.data();
+        let data_guard = self.elements();
         let x: &[f32] = &data_guard;
 
         // forward: outputs + argmax (absolute input indices)
@@ -1698,7 +1991,7 @@ impl Tensor {
         let out_spatial = h_out * w_out;
 
         // read-only input slice (drop the lock immediately)
-        let data_guard = self.data();
+        let data_guard = self.elements();
         let x: &[f32] = &data_guard;
 
         let mut output_data = vec![0.0; n * c * out_spatial];
@@ -1844,7 +2137,7 @@ impl Tensor {
         let num_windows = n * spatial;
         let mut col_data = vec![0.0; num_windows * col_size];
 
-        let data = self.data().clone(); // Clone once to avoid lock contention
+        let data = self.elements();
 
         col_data
             .par_chunks_mut(col_size)
@@ -1936,8 +2229,8 @@ impl Tensor {
         assert_eq!(self.shape[1], bias.shape[0]); // C_out
 
         let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let self_data = self.data();
-        let bias_data = bias.data();
+        let self_data = self.elements();
+        let bias_data = bias.elements();
 
         let mut result_data = vec![0.0; self_data.len()];
 
@@ -2011,7 +2304,7 @@ impl Tensor {
             old_shape[axes[3]],
         ];
 
-        let data = self.data();
+        let data = self.elements();
         let mut result_data = vec![0.0; data.len()];
 
         let (d0, d1, d2, d3) = (old_shape[0], old_shape[1], old_shape[2], old_shape[3]);
@@ -2112,7 +2405,7 @@ impl Tensor {
 
     /// Observed finite range of this tensor, widened so it is never degenerate.
     fn finite_range(&self) -> (f32, f32) {
-        let data = self.data();
+        let data = self.elements();
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
 
@@ -2150,7 +2443,7 @@ impl Tensor {
         // every value 128 codes too high and clipped half the dynamic range.
         let zero_point = (qmin as f32 - min_val / scale).round() as i32;
 
-        let data = self.data();
+        let data = self.elements();
         let codes = data
             .iter()
             .map(|&x| {
@@ -2208,7 +2501,7 @@ impl Tensor {
     /// Quantize to NF4: normalize by the absolute maximum, then snap each value
     /// to the nearest of the 16 NF4 levels.
     fn quantize_to_nf4(&self) -> NF4Tensor {
-        let data = self.data();
+        let data = self.elements();
         let absmax = data
             .iter()
             .filter(|x| x.is_finite())
