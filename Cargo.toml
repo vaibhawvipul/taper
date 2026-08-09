@@ -1,9 +1,20 @@
 [package]
 name = "taper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Vipul Vaibhaw <vaibhaw.vipul@gmail.com>"]
 build = "build.rs"
+description = "A lightweight neural network library with tape-based automatic differentiation, where every backward pass is verified against finite differences."
+license = "MIT"
+repository = "https://github.com/vaibhawvipul/taper"
+documentation = "https://docs.rs/taper"
+readme = "README.md"
+keywords = ["deep-learning", "autodiff", "neural-network", "machine-learning", "tensor"]
+categories = ["science", "algorithms"]
+# The MNIST download cache and benchmark scripts are not part of the library.
+# Patterns are anchored with a leading slash: a bare "data/" would also match
+# src/data/, which silently produced a package that would not compile.
+exclude = ["/data/", "/test_data/", "/*.py"]
 
 [dependencies]
 smallvec = "1.15.1"

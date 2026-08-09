@@ -1,3 +1,4 @@
+use crate::error::ShapeError;
 use crate::gemm::{TransFlag, n as no_trans, sgemm_rowmajor, t as trans};
 use crate::tensor::GemmLayout;
 use crate::{Tensor, tape::Tape};
@@ -25,8 +26,7 @@ use crate::tensor::simd;
 impl Add for &Tensor {
     type Output = Tensor;
     fn add(self, other: &Tensor) -> Tensor {
-        let (lhs, rhs) = broadcast_pair(self, other, "add");
-        elementwise_add(&lhs, &rhs)
+        self.try_add(other).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -36,15 +36,14 @@ impl Mul for &Tensor {
     // the multiplication itself, which clippy's heuristic cannot distinguish.
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn mul(self, other: &Tensor) -> Tensor {
-        let (lhs, rhs) = broadcast_pair(self, other, "mul");
-        elementwise_mul(&lhs, &rhs)
+        self.try_mul(other).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
 // Helper function to accumulate gradients with SIMD
 #[inline]
 pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
-    let mut slot = t.grad.write().expect("grad RwLock poisoned");
+    let mut slot = crate::tensor::write_recovering(&t.grad);
     let g = slot.get_or_insert_with(|| vec![0.0; t.numel()]);
     debug_assert_eq!(
         g.len(),
@@ -60,7 +59,7 @@ pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
 
 #[inline]
 pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
-    let mut slot = t.grad.write().expect("grad RwLock poisoned");
+    let mut slot = crate::tensor::write_recovering(&t.grad);
     let g = slot.get_or_insert_with(|| vec![0.0; t.numel()]);
     debug_assert_eq!(
         g.len(),
@@ -85,18 +84,22 @@ pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
 /// only as three hand-written special cases (`add_broadcast`,
 /// `sub_broadcast_rows`, `div_broadcast_rows`).
 #[inline]
-fn broadcast_pair(a: &Tensor, b: &Tensor, op: &str) -> (Tensor, Tensor) {
+fn broadcast_pair(
+    a: &Tensor,
+    b: &Tensor,
+    op: &'static str,
+) -> crate::error::Result<(Tensor, Tensor)> {
     if a.shape() == b.shape() {
-        return (a.clone(), b.clone());
+        return Ok((a.clone(), b.clone()));
     }
-    let target = crate::tensor::broadcast_shape(a.shape(), b.shape()).unwrap_or_else(|| {
-        panic!(
-            "{op}: shapes {:?} and {:?} do not broadcast",
-            a.shape(),
-            b.shape()
-        )
-    });
-    (a.expand(&target), b.expand(&target))
+    let target = crate::tensor::broadcast_shape(a.shape(), b.shape()).ok_or(
+        ShapeError::NotBroadcastable {
+            op,
+            lhs: a.shape().to_vec(),
+            rhs: b.shape().to_vec(),
+        },
+    )?;
+    Ok((a.expand(&target), b.expand(&target)))
 }
 
 // Implement other trait combinations
@@ -147,14 +150,31 @@ impl Tensor {
     /// Fast matrix multiplication: [m,k] @ [k,n] -> [m,n]
     /// Fast matrix multiplication: [m,k] @ [k,n_out] -> [m,n_out]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape.len(), 2, "First tensor must be 2D");
-        assert_eq!(other.shape.len(), 2, "Second tensor must be 2D");
+        self.try_matmul(other).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Matrix product, reporting a shape problem instead of panicking.
+    pub fn try_matmul(&self, other: &Tensor) -> crate::error::Result<Tensor> {
+        for t in [self, other] {
+            if t.shape.len() != 2 {
+                return Err(ShapeError::Rank {
+                    op: "matmul",
+                    expected: "a 2D tensor",
+                    got: t.shape.to_vec(),
+                });
+            }
+        }
+        if self.shape[1] != other.shape[0] {
+            return Err(ShapeError::Mismatch {
+                op: "matmul: inner dimensions",
+                lhs: self.shape.to_vec(),
+                rhs: other.shape.to_vec(),
+            });
+        }
 
         let m = self.shape[0] as i32;
         let k = self.shape[1] as i32;
-        let k2 = other.shape[0] as i32;
         let n_out = other.shape[1] as i32;
-        assert_eq!(k, k2, "Inner dimensions must match: {} vs {}", k, k2);
 
         // A transposed view is already the layout BLAS wants under its trans
         // flag, so it feeds straight in — no materialization. Anything with a
@@ -193,7 +213,7 @@ impl Tensor {
             let b_shape = other.shape.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout_vec) = out_t.grad.read().unwrap().as_ref() {
+                if let Some(gout_vec) = crate::tensor::read_recovering(&out_t.grad).as_ref() {
                     let gout = &gout_vec[..];
 
                     // dA += dC * B^T   (m×k) = (m×n_out) * (n_out×k)
@@ -206,7 +226,7 @@ impl Tensor {
                         // operand read out of the graph needs a layout flag.
                         let b_op = b_t.packed_operand();
                         let b_store = b_op.storage();
-                        let mut slot = a_t.grad.write().expect("grad RwLock poisoned");
+                        let mut slot = crate::tensor::write_recovering(&a_t.grad);
                         let ga = slot.get_or_insert_with(|| vec![0.0; (m * k) as usize]);
                         sgemm_rowmajor(
                             no_trans(),
@@ -230,7 +250,7 @@ impl Tensor {
 
                         let a_op = a_t.packed_operand();
                         let a_store = a_op.storage();
-                        let mut slot = b_t.grad.write().expect("grad RwLock poisoned");
+                        let mut slot = crate::tensor::write_recovering(&b_t.grad);
                         let gb = slot.get_or_insert_with(|| vec![0.0; (kdim * n_out) as usize]);
                         sgemm_rowmajor(
                             trans_flag(&a_op, true),
@@ -249,7 +269,7 @@ impl Tensor {
             });
         }
 
-        out
+        Ok(out)
     }
 
     /// Create a random tensor with values from normal distribution
@@ -311,7 +331,7 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().unwrap().as_ref() {
+                if let Some(gout) = crate::tensor::read_recovering(&out.grad).as_ref() {
                     let x = input.data();
                     let mut slot = input.grad.write().unwrap();
                     if slot.is_none() {
@@ -332,8 +352,7 @@ impl Tensor {
 impl Sub for &Tensor {
     type Output = Tensor;
     fn sub(self, other: &Tensor) -> Tensor {
-        let (lhs, rhs) = broadcast_pair(self, other, "sub");
-        elementwise_sub(&lhs, &rhs)
+        self.try_sub(other).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -362,8 +381,7 @@ impl Sub for Tensor {
 impl Div for &Tensor {
     type Output = Tensor;
     fn div(self, other: &Tensor) -> Tensor {
-        let (lhs, rhs) = broadcast_pair(self, other, "div");
-        elementwise_div(&lhs, &rhs)
+        self.try_div(other).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -409,7 +427,7 @@ fn elementwise_add(this: &Tensor, other: &Tensor) -> Tensor {
         let o = out.clone();
 
         Tape::push_binary_op(this, other, &out, move || {
-            if let Some(gout) = o.grad.read().unwrap().as_ref() {
+            if let Some(gout) = crate::tensor::read_recovering(&o.grad).as_ref() {
                 if a.requires_grad {
                     accumulate_grad(&a, gout);
                 }
@@ -442,13 +460,13 @@ fn elementwise_mul(this: &Tensor, other: &Tensor) -> Tensor {
         let o = out.clone();
 
         Tape::push_binary_op(this, other, &out, move || {
-            if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+            if let Some(gout) = crate::tensor::read_recovering(&o.grad).as_ref() {
                 // d/da (a*b) = b, d/db (a*b) = a. Each branch used to size the
                 // gradient from the *other* operand's data and round-trip
                 // through two scratch buffers; fold it into one pass.
                 if a.requires_grad {
                     let bdat = b.elements();
-                    let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = crate::tensor::write_recovering(&a.grad);
                     let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
                     for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
                         *g += go * bv;
@@ -456,7 +474,7 @@ fn elementwise_mul(this: &Tensor, other: &Tensor) -> Tensor {
                 }
                 if b.requires_grad {
                     let adat = a.elements();
-                    let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = crate::tensor::write_recovering(&b.grad);
                     let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
                     for ((g, &go), &av) in gb.iter_mut().zip(gout.iter()).zip(adat.iter()) {
                         *g += go * av;
@@ -488,7 +506,7 @@ fn elementwise_sub(this: &Tensor, other: &Tensor) -> Tensor {
         let o = out.clone();
 
         Tape::push_binary_op(this, other, &out, move || {
-            if let Some(gout) = o.grad.read().unwrap().as_ref() {
+            if let Some(gout) = crate::tensor::read_recovering(&o.grad).as_ref() {
                 if a.requires_grad {
                     accumulate_grad(&a, gout);
                 }
@@ -521,11 +539,11 @@ fn elementwise_div(this: &Tensor, other: &Tensor) -> Tensor {
         let o = out.clone();
 
         Tape::push_binary_op(this, other, &out, move || {
-            if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+            if let Some(gout) = crate::tensor::read_recovering(&o.grad).as_ref() {
                 // d/da (a/b) = 1/b, d/db (a/b) = -a/b²
                 if a.requires_grad {
                     let bdat = b.elements();
-                    let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = crate::tensor::write_recovering(&a.grad);
                     let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
                     for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
                         *g += go / bv;
@@ -534,7 +552,7 @@ fn elementwise_div(this: &Tensor, other: &Tensor) -> Tensor {
                 if b.requires_grad {
                     let adat = a.elements();
                     let bdat = b.elements();
-                    let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = crate::tensor::write_recovering(&b.grad);
                     let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
                     for (((g, &go), &av), &bv) in gb
                         .iter_mut()
@@ -549,4 +567,30 @@ fn elementwise_div(this: &Tensor, other: &Tensor) -> Tensor {
         });
     }
     out
+}
+
+impl Tensor {
+    /// Element-wise sum with broadcasting, reporting incompatible shapes.
+    pub fn try_add(&self, other: &Tensor) -> crate::error::Result<Tensor> {
+        let (lhs, rhs) = broadcast_pair(self, other, "add")?;
+        Ok(elementwise_add(&lhs, &rhs))
+    }
+
+    /// Element-wise difference with broadcasting, reporting incompatible shapes.
+    pub fn try_sub(&self, other: &Tensor) -> crate::error::Result<Tensor> {
+        let (lhs, rhs) = broadcast_pair(self, other, "sub")?;
+        Ok(elementwise_sub(&lhs, &rhs))
+    }
+
+    /// Element-wise product with broadcasting, reporting incompatible shapes.
+    pub fn try_mul(&self, other: &Tensor) -> crate::error::Result<Tensor> {
+        let (lhs, rhs) = broadcast_pair(self, other, "mul")?;
+        Ok(elementwise_mul(&lhs, &rhs))
+    }
+
+    /// Element-wise quotient with broadcasting, reporting incompatible shapes.
+    pub fn try_div(&self, other: &Tensor) -> crate::error::Result<Tensor> {
+        let (lhs, rhs) = broadcast_pair(self, other, "div")?;
+        Ok(elementwise_div(&lhs, &rhs))
+    }
 }

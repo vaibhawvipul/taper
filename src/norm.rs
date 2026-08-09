@@ -17,6 +17,7 @@
 //! Both backwards are checked against finite differences in `tests/norm.rs`.
 
 use crate::tape::Tape;
+use crate::tensor::read_recovering;
 use crate::{Tensor, nn::Module, ops};
 
 /// The shared backward for a normalized group.
@@ -142,13 +143,7 @@ impl Module for LayerNorm {
             let out_t = output.clone();
 
             Tape::push_unary_op(input, &output, move || {
-                let Some(gout) = out_t
-                    .grad
-                    .read()
-                    .expect("grad RwLock poisoned")
-                    .as_ref()
-                    .cloned()
-                else {
+                let Some(gout) = read_recovering(&out_t.grad).as_ref().cloned() else {
                     return;
                 };
 
@@ -355,13 +350,7 @@ impl Module for BatchNorm2d {
             let training = self.training;
 
             Tape::push_unary_op(input, &output, move || {
-                let Some(gout) = out_t
-                    .grad
-                    .read()
-                    .expect("grad RwLock poisoned")
-                    .as_ref()
-                    .cloned()
-                else {
+                let Some(gout) = read_recovering(&out_t.grad).as_ref().cloned() else {
                     return;
                 };
 

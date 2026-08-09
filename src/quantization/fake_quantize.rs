@@ -9,6 +9,7 @@ use std::sync::RwLock;
 use super::config::{QuantizationConfig, QuantizationType};
 use super::observers::MinMaxObserver;
 use crate::Tensor;
+use crate::tensor::{read_recovering, write_recovering};
 
 /// Quantization parameters, refined as the observer sees more data.
 #[derive(Debug, Clone, Copy)]
@@ -46,13 +47,8 @@ impl Clone for FakeQuantize {
     fn clone(&self) -> Self {
         Self {
             quant_config: self.quant_config.clone(),
-            params: RwLock::new(*self.params.read().expect("qparams lock poisoned")),
-            observer: RwLock::new(
-                self.observer
-                    .read()
-                    .expect("observer lock poisoned")
-                    .clone(),
-            ),
+            params: RwLock::new(*read_recovering(&self.params)),
+            observer: RwLock::new(read_recovering(&self.observer).clone()),
             training: self.training,
             qmin: self.qmin,
             qmax: self.qmax,
@@ -108,10 +104,7 @@ impl FakeQuantize {
 
     /// Whether the observer has seen enough data to derive a scale.
     pub fn is_calibrated(&self) -> bool {
-        self.params
-            .read()
-            .expect("qparams lock poisoned")
-            .calibrated
+        read_recovering(&self.params).calibrated
     }
 
     /// Update quantization parameters based on observed data
@@ -126,13 +119,13 @@ impl FakeQuantize {
         }
 
         let (min_val, max_val) = {
-            let mut observer = self.observer.write().expect("observer lock poisoned");
+            let mut observer = write_recovering(&self.observer);
             observer.observe_slice(data);
             observer.range()
         };
         let (min_val, max_val) = Self::widen_degenerate(min_val, max_val);
 
-        let mut params = self.params.write().expect("qparams lock poisoned");
+        let mut params = write_recovering(&self.params);
         if self.symmetric {
             let max_abs = min_val.abs().max(max_val.abs());
             // A tensor of all zeros gives max_abs == 0; dividing by the
@@ -189,7 +182,7 @@ impl FakeQuantize {
         // is what makes the first forward pass produce a real scale instead of
         // reusing the placeholder 1.0.
         self.observe(&data);
-        let params = *self.params.read().expect("qparams lock poisoned");
+        let params = *read_recovering(&self.params);
 
         let mut result = vec![0.0; data.len()];
         match self.quant_config.quant_type {
@@ -212,12 +205,7 @@ impl FakeQuantize {
 
             // Use straight-through estimator: forward quantizes, backward passes through
             crate::tape::Tape::push_unary_op(input, &output, move || {
-                if let Some(grad_output) = output_clone
-                    .grad
-                    .read()
-                    .expect("grad RwLock poisoned")
-                    .as_ref()
-                {
+                if let Some(grad_output) = read_recovering(&output_clone.grad).as_ref() {
                     // STE: gradient passes through unchanged
                     crate::ops::accumulate_grad(&input_clone, grad_output);
                 }
@@ -259,15 +247,12 @@ impl FakeQuantize {
 
     /// Get current scale
     pub fn scale(&self) -> f32 {
-        self.params.read().expect("qparams lock poisoned").scale
+        read_recovering(&self.params).scale
     }
 
     /// Get current zero point
     pub fn zero_point(&self) -> i32 {
-        self.params
-            .read()
-            .expect("qparams lock poisoned")
-            .zero_point
+        read_recovering(&self.params).zero_point
     }
 
     /// Get quantization configuration

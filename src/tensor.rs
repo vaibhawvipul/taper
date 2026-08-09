@@ -1,3 +1,4 @@
+use crate::error::ShapeError;
 use crate::{ops, quantization::QuantizationConfig, tape::Tape};
 use smallvec::SmallVec;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
@@ -441,6 +442,26 @@ impl std::ops::Deref for Elements<'_> {
     }
 }
 
+/// Take a read lock, recovering if a previous holder panicked.
+///
+/// A poisoned lock would otherwise disable a tensor permanently: every later
+/// access panics, so one bad request takes a parameter out of service for the
+/// life of the process. Recovery is sound here because the guarded value is a
+/// plain numeric buffer — there is no invariant a partial write could violate,
+/// only values that may be stale.
+#[inline]
+pub(crate) fn read_recovering<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Take a write lock, recovering if a previous holder panicked. See
+/// [`read_recovering`].
+#[inline]
+pub(crate) fn write_recovering<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// How a 2D tensor's memory maps onto a GEMM operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GemmLayout {
@@ -650,7 +671,7 @@ impl Int8Tensor {
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<i8>> {
-        self.data.read().expect("Int8Tensor data lock poisoned")
+        read_recovering(&self.data)
     }
 
     pub fn scale(&self) -> f32 {
@@ -685,7 +706,7 @@ impl Int4Tensor {
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
-        self.data.read().expect("Int4Tensor data lock poisoned")
+        read_recovering(&self.data)
     }
 
     pub fn scale(&self) -> f32 {
@@ -720,7 +741,7 @@ impl Float16Tensor {
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u16>> {
-        self.data.read().expect("Float16Tensor data lock poisoned")
+        read_recovering(&self.data)
     }
 }
 
@@ -747,7 +768,7 @@ impl BFloat16Tensor {
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u16>> {
-        self.data.read().expect("BFloat16Tensor data lock poisoned")
+        read_recovering(&self.data)
     }
 }
 
@@ -772,7 +793,7 @@ impl NF4Tensor {
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
-        self.data.read().expect("NF4Tensor data lock poisoned")
+        read_recovering(&self.data)
     }
 
     /// The absolute-maximum scale the 4-bit codes are normalized against.
@@ -782,16 +803,25 @@ impl NF4Tensor {
 }
 
 impl Tensor {
+    /// # Panics
+    /// If `data` does not exactly fill `shape`. Use [`Tensor::try_new`] when the
+    /// shape comes from data rather than from the program.
     pub fn new(data: Vec<f32>, shape: &[usize]) -> Self {
+        Self::try_new(data, shape).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Build a tensor, reporting a length mismatch instead of panicking.
+    pub fn try_new(data: Vec<f32>, shape: &[usize]) -> crate::error::Result<Self> {
         let expected: usize = shape.iter().product();
-        assert_eq!(
-            data.len(),
-            expected,
-            "Tensor::new: {} values do not fill shape {:?}",
-            data.len(),
-            shape
-        );
-        Tensor {
+        if data.len() != expected {
+            return Err(ShapeError::Length {
+                op: "Tensor::new",
+                expected,
+                got: data.len(),
+                shape: shape.to_vec(),
+            });
+        }
+        Ok(Tensor {
             data: Arc::new(RwLock::new(Storage::F32(data))),
             stride: contiguous_strides(shape),
             offset: 0,
@@ -799,7 +829,7 @@ impl Tensor {
             grad: Arc::new(RwLock::new(None)),
             requires_grad: false,
             tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(crate::tape::NO_NODE)),
-        }
+        })
     }
 
     /// Total number of elements.
@@ -814,7 +844,7 @@ impl Tensor {
 
     /// The element type this tensor stores.
     pub fn dtype(&self) -> DType {
-        self.data.read().expect("data RwLock poisoned").dtype()
+        read_recovering(&self.data).dtype()
     }
 
     /// Build a tensor directly over a typed buffer.
@@ -856,7 +886,7 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                if let Some(gout) = read_recovering(&out.grad).as_ref() {
                     ops::accumulate_grad(&input, gout);
                 }
             });
@@ -867,7 +897,7 @@ impl Tensor {
 
     /// Bytes this tensor's storage occupies.
     pub fn storage_bytes(&self) -> usize {
-        let storage = self.data.read().expect("data RwLock poisoned");
+        let storage = read_recovering(&self.data);
         storage.len() * storage.dtype().size_of()
     }
 
@@ -883,7 +913,7 @@ impl Tensor {
     /// Whether this tensor spans its entire backing buffer, so the raw slice
     /// from `data()` is exactly its logical elements in order.
     fn owns_whole_storage(&self) -> bool {
-        let storage = self.data.read().expect("data RwLock poisoned");
+        let storage = read_recovering(&self.data);
         self.offset == 0
             && self.is_contiguous()
             && storage.len() == self.numel()
@@ -914,7 +944,7 @@ impl Tensor {
     /// Callers must account for `offset` and `stride` themselves.
     #[inline]
     pub(crate) fn storage(&self) -> RwLockReadGuard<'_, Storage> {
-        self.data.read().expect("data RwLock poisoned")
+        read_recovering(&self.data)
     }
 
     /// How a 2D tensor maps onto a GEMM operand, if it maps at all.
@@ -943,7 +973,7 @@ impl Tensor {
     #[inline]
     pub fn elements(&self) -> Elements<'_> {
         if self.owns_whole_storage() {
-            Elements::Borrowed(F32Ref(self.data.read().expect("data RwLock poisoned")))
+            Elements::Borrowed(F32Ref(read_recovering(&self.data)))
         } else {
             Elements::Owned(self.to_vec())
         }
@@ -997,9 +1027,9 @@ impl Tensor {
             let target: SmallVec<[usize; 4]> = target.iter().copied().collect();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                if let Some(gout) = read_recovering(&out.grad).as_ref() {
                     let src_strides = contiguous_strides(&src_shape);
-                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = write_recovering(&input.grad);
                     let gin = slot.get_or_insert_with(|| vec![0.0; src_shape.iter().product()]);
 
                     // Every expanded position folds back onto the source
@@ -1064,9 +1094,9 @@ impl Tensor {
             let base_shape = self.shape.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                if let Some(gout) = read_recovering(&out.grad).as_ref() {
                     let base_strides = contiguous_strides(&base_shape);
-                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let mut slot = write_recovering(&input.grad);
                     let gin = slot.get_or_insert_with(|| vec![0.0; base_shape.iter().product()]);
 
                     // Walk the window's logical positions, shifting the sliced
@@ -1144,7 +1174,7 @@ impl Tensor {
     /// Walks the strides, so it is correct for any view; the contiguous case
     /// short-circuits to a plain clone.
     pub fn to_vec(&self) -> Vec<f32> {
-        let storage = self.data.read().expect("data RwLock poisoned");
+        let storage = read_recovering(&self.data);
         if self.is_dense(&storage) {
             return storage.to_f32_vec();
         }
@@ -1160,7 +1190,7 @@ impl Tensor {
     /// values `f32` could not represent exactly — which is what serialization
     /// needs.
     pub fn to_storage(&self) -> Storage {
-        let storage = self.data.read().expect("data RwLock poisoned");
+        let storage = read_recovering(&self.data);
         if self.is_dense(&storage) {
             return storage.clone();
         }
@@ -1195,7 +1225,7 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                if let Some(gout) = read_recovering(&out.grad).as_ref() {
                     ops::accumulate_grad(&input, gout);
                 }
             });
@@ -1251,14 +1281,14 @@ impl Tensor {
     #[inline]
     pub fn data(&self) -> F32Ref<'_> {
         self.assert_dense_f32("data()");
-        F32Ref(self.data.read().expect("data RwLock poisoned"))
+        F32Ref(read_recovering(&self.data))
     }
 
     /// Mutable access to the raw backing slice. Same restriction as [`Tensor::data`].
     #[inline]
     pub fn data_mut(&self) -> F32Mut<'_> {
         self.assert_dense_f32("data_mut()");
-        F32Mut(self.data.write().expect("data RwLock poisoned"))
+        F32Mut(write_recovering(&self.data))
     }
 
     /// Read-only view of grad vector if it exists.
@@ -1267,20 +1297,20 @@ impl Tensor {
     /// as optimizer steps, which borrows it under the lock instead.
     #[inline]
     pub fn grad_ref(&self) -> Option<std::sync::Arc<Vec<f32>>> {
-        let g = self.grad.read().expect("grad RwLock poisoned");
+        let g = read_recovering(&self.grad);
         g.as_ref().map(|v| std::sync::Arc::new(v.clone()))
     }
 
     /// Borrow the gradient under the read lock, returning `None` if unset.
     #[inline]
     pub fn with_grad<R>(&self, f: impl FnOnce(&[f32]) -> R) -> Option<R> {
-        let g = self.grad.read().expect("grad RwLock poisoned");
+        let g = read_recovering(&self.grad);
         g.as_ref().map(|v| f(v))
     }
 
     /// Convenience: clone grads into a new non-requiring-grad Tensor
     pub fn grad(&self) -> Option<Arc<Tensor>> {
-        let g = self.grad.read().expect("grad RwLock poisoned");
+        let g = read_recovering(&self.grad);
         g.as_ref().map(|v| {
             let mut t = Tensor::new(v.clone(), &self.shape);
             t.requires_grad = false;
@@ -1292,7 +1322,7 @@ impl Tensor {
         // Gradients are sized by logical element count, which for a view is not
         // the length of its (shared, possibly larger) backing storage.
         let ones = vec![1.0; self.numel()];
-        *self.grad.write().expect("grad RwLock poisoned") = Some(ones);
+        *write_recovering(&self.grad) = Some(ones);
 
         // `NO_NODE` (not 0) marks a tensor that is not the output of a recorded
         // op — node ids are indices and legitimately start at 0.
@@ -1300,7 +1330,7 @@ impl Tensor {
     }
 
     pub fn zero_grad(&self) {
-        *self.grad.write().expect("grad RwLock poisoned") = None;
+        *write_recovering(&self.grad) = None;
     }
 
     /// Transpose a 2D tensor. This is a view: it swaps the shape and stride
@@ -1635,14 +1665,20 @@ impl Tensor {
     /// change. A non-contiguous view has to be packed first, since its logical
     /// order is not the order its elements sit in memory.
     pub fn reshape(&self, shape: &[usize]) -> Tensor {
+        self.try_reshape(shape).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Reshape, reporting an element-count mismatch instead of panicking.
+    pub fn try_reshape(&self, shape: &[usize]) -> crate::error::Result<Tensor> {
         let total_elements: usize = shape.iter().product();
-        assert_eq!(
-            self.numel(),
-            total_elements,
-            "Cannot reshape tensor of size {} to shape {:?}",
-            self.numel(),
-            shape
-        );
+        if self.numel() != total_elements {
+            return Err(ShapeError::Length {
+                op: "reshape",
+                expected: total_elements,
+                got: self.numel(),
+                shape: shape.to_vec(),
+            });
+        }
 
         let mut output = if self.is_contiguous() {
             self.view_with(
@@ -1676,7 +1712,7 @@ impl Tensor {
             });
         }
 
-        output
+        Ok(output)
     }
 
     /// Flatten tensor starting from start_dim
@@ -2543,8 +2579,8 @@ impl Tensor {
             let out = output.clone();
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gcol) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
-                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                if let Some(gcol) = read_recovering(&out.grad).as_ref() {
+                    let mut slot = write_recovering(&input.grad);
                     let gin = slot.get_or_insert_with(|| vec![0.0; n * c * h_in * w_in]);
 
                     // Scatter-add: overlapping windows contribute to the same
@@ -2709,8 +2745,8 @@ impl Tensor {
             let axes = *axes;
 
             Tape::push_unary_op(self, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
-                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                if let Some(gout) = read_recovering(&out.grad).as_ref() {
+                    let mut slot = write_recovering(&input.grad);
                     let gin = slot.get_or_insert_with(|| vec![0.0; d0 * d1 * d2 * d3]);
 
                     // Same index map as the forward pass, run in reverse.

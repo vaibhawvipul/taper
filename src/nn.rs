@@ -1008,12 +1008,12 @@ impl Tensor {
             // weights ever received a gradient.
             let parents: Vec<&Tensor> = tensors.iter().collect();
             crate::tape::Tape::push_op(&parents, &output, move || {
-                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                if let Some(gout) = crate::tensor::read_recovering(&out.grad).as_ref() {
                     for (tensor, positions) in inputs.iter().zip(source_positions.iter()) {
                         if !tensor.requires_grad {
                             continue;
                         }
-                        let mut slot = tensor.grad.write().expect("grad RwLock poisoned");
+                        let mut slot = crate::tensor::write_recovering(&tensor.grad);
                         let gin = slot.get_or_insert_with(|| vec![0.0; tensor.numel()]);
                         for (local, &pos) in positions.iter().enumerate() {
                             gin[local] += gout[pos];
