@@ -21,6 +21,8 @@ blas-src   = { version = "0.10", default-features = false, optional = true } # v
 openblas-src = { version = "0.10", default-features = false, features = ["system"], optional = true }
 rayon = { version = "1.10" }
 lazy_static = "1.4"
+# Already in the tree via reqwest; used for the safetensors JSON header.
+serde_json = "1"
 
 [features]
 # Default: pure-Rust GEMM (matrixmultiply)
@@ -37,4 +39,5 @@ blas-accelerate = ["blas", "blas-src/accelerate"] # macOS Accelerate
 
 [dev-dependencies]
 criterion = "0.5"
+serde_json = "1"
 approx = "0.5"

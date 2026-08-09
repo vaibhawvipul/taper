@@ -288,7 +288,7 @@ impl DType {
 }
 
 /// A tensor's backing buffer, in one of the supported element types.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Storage {
     F32(Vec<f32>),
     BF16(Vec<u16>),
@@ -1108,25 +1108,19 @@ impl Tensor {
         }
     }
 
-    /// This tensor's logical elements in row-major order.
+    /// Visit each logical position's index into the backing storage, in
+    /// row-major order.
     ///
-    /// Walks the strides, so it is correct for any view; the contiguous case
-    /// short-circuits to a plain clone.
-    pub fn to_vec(&self) -> Vec<f32> {
-        let storage = self.data.read().expect("data RwLock poisoned");
-        if self.offset == 0 && self.is_contiguous() && storage.len() == self.numel() {
-            return storage.to_f32_vec();
-        }
-
+    /// Odometer walk: advance the fastest-varying dimension, carrying over.
+    #[inline]
+    fn for_each_storage_index(&self, mut visit: impl FnMut(usize)) {
         let n = self.numel();
-        let mut out = Vec::with_capacity(n);
         let ndim = self.shape.len();
         let mut index = vec![0usize; ndim];
         let mut cursor = self.offset;
 
-        // Odometer walk: advance the fastest-varying dimension, carrying over.
         for _ in 0..n {
-            out.push(storage.get_f32(cursor));
+            visit(cursor);
             for d in (0..ndim).rev() {
                 index[d] += 1;
                 cursor += self.stride[d];
@@ -1137,7 +1131,50 @@ impl Tensor {
                 index[d] = 0;
             }
         }
+    }
+
+    /// Whether this tensor is exactly its backing buffer, in order.
+    #[inline]
+    fn is_dense(&self, storage: &Storage) -> bool {
+        self.offset == 0 && self.is_contiguous() && storage.len() == self.numel()
+    }
+
+    /// This tensor's logical elements in row-major order, widened to `f32`.
+    ///
+    /// Walks the strides, so it is correct for any view; the contiguous case
+    /// short-circuits to a plain clone.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let storage = self.data.read().expect("data RwLock poisoned");
+        if self.is_dense(&storage) {
+            return storage.to_f32_vec();
+        }
+
+        let mut out = Vec::with_capacity(self.numel());
+        self.for_each_storage_index(|i| out.push(storage.get_f32(i)));
         out
+    }
+
+    /// This tensor's logical elements as a dense buffer **in its own dtype**.
+    ///
+    /// Unlike [`Tensor::to_vec`] this does not widen, so an `i32` tensor keeps
+    /// values `f32` could not represent exactly — which is what serialization
+    /// needs.
+    pub fn to_storage(&self) -> Storage {
+        let storage = self.data.read().expect("data RwLock poisoned");
+        if self.is_dense(&storage) {
+            return storage.clone();
+        }
+
+        let mut indices = Vec::with_capacity(self.numel());
+        self.for_each_storage_index(|i| indices.push(i));
+
+        match &*storage {
+            Storage::F32(v) => Storage::F32(indices.iter().map(|&i| v[i]).collect()),
+            Storage::BF16(v) => Storage::BF16(indices.iter().map(|&i| v[i]).collect()),
+            Storage::F16(v) => Storage::F16(indices.iter().map(|&i| v[i]).collect()),
+            Storage::I32(v) => Storage::I32(indices.iter().map(|&i| v[i]).collect()),
+            Storage::U8(v) => Storage::U8(indices.iter().map(|&i| v[i]).collect()),
+        }
     }
 
     /// A densely packed tensor with the same logical contents.
