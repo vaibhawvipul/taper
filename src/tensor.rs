@@ -308,6 +308,38 @@ pub enum GemmLayout {
     Transposed,
 }
 
+/// The shape two operands broadcast to under NumPy rules, or `None` if they
+/// are incompatible.
+///
+/// Shapes are right-aligned; along each axis the extents must match, or one of
+/// them must be 1 (which is then stretched).
+pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<SmallVec<[usize; 4]>> {
+    let rank = a.len().max(b.len());
+    let mut out: SmallVec<[usize; 4]> = smallvec::smallvec![0; rank];
+
+    for i in 0..rank {
+        // Missing leading axes behave as extent 1.
+        let da = if i + a.len() >= rank {
+            a[i + a.len() - rank]
+        } else {
+            1
+        };
+        let db = if i + b.len() >= rank {
+            b[i + b.len() - rank]
+        } else {
+            1
+        };
+
+        out[i] = match (da, db) {
+            (x, y) if x == y => x,
+            (1, y) => y,
+            (x, 1) => x,
+            _ => return None,
+        };
+    }
+    Some(out)
+}
+
 /// Row-major strides for a densely packed tensor of this shape.
 pub(crate) fn contiguous_strides(shape: &[usize]) -> SmallVec<[usize; 4]> {
     let mut strides: SmallVec<[usize; 4]> = smallvec::smallvec![1; shape.len()];
@@ -712,6 +744,88 @@ impl Tensor {
         } else {
             Elements::Owned(self.to_vec())
         }
+    }
+
+    /// Stretch this tensor to `target` under NumPy broadcasting rules.
+    ///
+    /// This copies nothing: a stretched axis gets **stride 0**, so every index
+    /// along it reads the same element. Backward sums the gradient back over
+    /// the stretched axes, which is what makes a broadcast bias accumulate
+    /// contributions from the whole batch.
+    pub fn expand(&self, target: &[usize]) -> Tensor {
+        if self.shape.as_slice() == target {
+            return self.clone();
+        }
+        assert!(
+            target.len() >= self.shape.len(),
+            "expand: cannot reduce rank {:?} -> {target:?}",
+            self.shape
+        );
+
+        let lead = target.len() - self.shape.len();
+        let mut stride: SmallVec<[usize; 4]> = smallvec::smallvec![0; target.len()];
+
+        for (i, &want) in target.iter().enumerate() {
+            if i < lead {
+                // A new leading axis: repeat the whole tensor along it.
+                stride[i] = 0;
+                continue;
+            }
+            let have = self.shape[i - lead];
+            if have == want {
+                stride[i] = self.stride[i - lead];
+            } else if have == 1 {
+                stride[i] = 0;
+            } else {
+                panic!(
+                    "expand: cannot stretch axis {i} from {have} to {want} ({:?} -> {target:?})",
+                    self.shape
+                );
+            }
+        }
+
+        let mut output = self.view_with(target.iter().copied().collect(), stride, self.offset);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+            let src_shape = self.shape.clone();
+            let target: SmallVec<[usize; 4]> = target.iter().copied().collect();
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    let src_strides = contiguous_strides(&src_shape);
+                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let gin = slot.get_or_insert_with(|| vec![0.0; src_shape.iter().product()]);
+
+                    // Every expanded position folds back onto the source
+                    // element it was reading, so stretched axes sum.
+                    let rank = target.len();
+                    let mut index = vec![0usize; rank];
+                    for &g in gout.iter() {
+                        let mut flat = 0;
+                        for (d, &coord) in index.iter().enumerate().skip(lead) {
+                            let s = d - lead;
+                            if src_shape[s] != 1 {
+                                flat += coord * src_strides[s];
+                            }
+                        }
+                        gin[flat] += g;
+
+                        for d in (0..rank).rev() {
+                            index[d] += 1;
+                            if index[d] < target[d] {
+                                break;
+                            }
+                            index[d] = 0;
+                        }
+                    }
+                }
+            });
+        }
+
+        output
     }
 
     /// A contiguous run of `len` entries along `dim`, as a view.

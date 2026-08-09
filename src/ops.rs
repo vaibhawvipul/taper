@@ -25,37 +25,8 @@ use crate::tensor::simd;
 impl Add for &Tensor {
     type Output = Tensor;
     fn add(self, other: &Tensor) -> Tensor {
-        assert_same_shape(self, other, "add");
-
-        let a_data = self.elements();
-        let b_data = other.elements();
-        let mut out_data = vec![0.0; a_data.len()];
-
-        // Use SIMD operations
-        unsafe {
-            simd::add_f32_simd(&a_data, &b_data, &mut out_data);
-        }
-
-        let mut out = Tensor::new(out_data, &self.shape);
-
-        if self.requires_grad || other.requires_grad {
-            out.requires_grad = true;
-            let a = self.clone();
-            let b = other.clone();
-            let o = out.clone();
-
-            Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().unwrap().as_ref() {
-                    if a.requires_grad {
-                        accumulate_grad(&a, gout);
-                    }
-                    if b.requires_grad {
-                        accumulate_grad(&b, gout);
-                    }
-                }
-            });
-        }
-        out
+        let (lhs, rhs) = broadcast_pair(self, other, "add");
+        elementwise_add(&lhs, &rhs)
     }
 }
 
@@ -65,50 +36,8 @@ impl Mul for &Tensor {
     // the multiplication itself, which clippy's heuristic cannot distinguish.
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn mul(self, other: &Tensor) -> Tensor {
-        assert_same_shape(self, other, "mul");
-
-        let self_data = self.elements();
-        let other_data = other.elements();
-        let mut out_data = vec![0.0; self_data.len()];
-
-        // Use SIMD operations
-        unsafe {
-            simd::mul_f32_simd(&self_data, &other_data, &mut out_data);
-        }
-
-        let mut out = Tensor::new(out_data, &self.shape);
-
-        if self.requires_grad || other.requires_grad {
-            out.requires_grad = true;
-            let a = self.clone();
-            let b = other.clone();
-            let o = out.clone();
-
-            Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
-                    // d/da (a*b) = b, d/db (a*b) = a. Each branch used to size the
-                    // gradient from the *other* operand's data and round-trip
-                    // through two scratch buffers; fold it into one pass.
-                    if a.requires_grad {
-                        let bdat = b.elements();
-                        let mut slot = a.grad.write().expect("grad RwLock poisoned");
-                        let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
-                        for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
-                            *g += go * bv;
-                        }
-                    }
-                    if b.requires_grad {
-                        let adat = a.elements();
-                        let mut slot = b.grad.write().expect("grad RwLock poisoned");
-                        let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
-                        for ((g, &go), &av) in gb.iter_mut().zip(gout.iter()).zip(adat.iter()) {
-                            *g += go * av;
-                        }
-                    }
-                }
-            });
-        }
-        out
+        let (lhs, rhs) = broadcast_pair(self, other, "mul");
+        elementwise_mul(&lhs, &rhs)
     }
 }
 
@@ -145,19 +74,29 @@ pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
     }
 }
 
-/// Shared precondition for the element-wise operators: identical shapes.
+/// Bring two element-wise operands to a common shape under NumPy rules.
 ///
-/// Checking only the flat length let `[2,3] + [3,2]` through and silently
-/// produced a result labelled with the left operand's shape.
+/// Returns the operands already stretched, so the caller works with matching
+/// extents. Equal shapes short-circuit to plain clones, keeping the common case
+/// free; anything else becomes a stride-0 view, and `expand`'s backward sums
+/// the gradient back over the stretched axes.
+///
+/// Previously the operators demanded identical shapes and broadcasting existed
+/// only as three hand-written special cases (`add_broadcast`,
+/// `sub_broadcast_rows`, `div_broadcast_rows`).
 #[inline]
-fn assert_same_shape(a: &Tensor, b: &Tensor, op: &str) {
-    assert_eq!(
-        a.shape(),
-        b.shape(),
-        "{op}: tensor shapes must match ({:?} vs {:?})",
-        a.shape(),
-        b.shape()
-    );
+fn broadcast_pair(a: &Tensor, b: &Tensor, op: &str) -> (Tensor, Tensor) {
+    if a.shape() == b.shape() {
+        return (a.clone(), b.clone());
+    }
+    let target = crate::tensor::broadcast_shape(a.shape(), b.shape()).unwrap_or_else(|| {
+        panic!(
+            "{op}: shapes {:?} and {:?} do not broadcast",
+            a.shape(),
+            b.shape()
+        )
+    });
+    (a.expand(&target), b.expand(&target))
 }
 
 // Implement other trait combinations
@@ -393,37 +332,8 @@ impl Tensor {
 impl Sub for &Tensor {
     type Output = Tensor;
     fn sub(self, other: &Tensor) -> Tensor {
-        assert_same_shape(self, other, "sub");
-
-        let self_data = self.elements();
-        let other_data = other.elements();
-        let mut out_data = vec![0.0; self_data.len()];
-
-        // Subtract using SIMD - we can reuse add with negation
-        for i in 0..out_data.len() {
-            out_data[i] = self_data[i] - other_data[i];
-        }
-
-        let mut out = Tensor::new(out_data, &self.shape);
-
-        if self.requires_grad || other.requires_grad {
-            out.requires_grad = true;
-            let a = self.clone();
-            let b = other.clone();
-            let o = out.clone();
-
-            Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().unwrap().as_ref() {
-                    if a.requires_grad {
-                        accumulate_grad(&a, gout);
-                    }
-                    if b.requires_grad {
-                        accumulate_grad_scaled(&b, gout, -1.0);
-                    }
-                }
-            });
-        }
-        out
+        let (lhs, rhs) = broadcast_pair(self, other, "sub");
+        elementwise_sub(&lhs, &rhs)
     }
 }
 
@@ -452,54 +362,8 @@ impl Sub for Tensor {
 impl Div for &Tensor {
     type Output = Tensor;
     fn div(self, other: &Tensor) -> Tensor {
-        assert_same_shape(self, other, "div");
-
-        let self_data = self.elements();
-        let other_data = other.elements();
-        let mut out_data = vec![0.0; self_data.len()];
-
-        // Element-wise division
-        for i in 0..out_data.len() {
-            out_data[i] = self_data[i] / other_data[i];
-        }
-
-        let mut out = Tensor::new(out_data, &self.shape);
-
-        if self.requires_grad || other.requires_grad {
-            out.requires_grad = true;
-            let a = self.clone();
-            let b = other.clone();
-            let o = out.clone();
-
-            Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
-                    // d/da (a/b) = 1/b, d/db (a/b) = -a/b²
-                    if a.requires_grad {
-                        let bdat = b.elements();
-                        let mut slot = a.grad.write().expect("grad RwLock poisoned");
-                        let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
-                        for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
-                            *g += go / bv;
-                        }
-                    }
-                    if b.requires_grad {
-                        let adat = a.elements();
-                        let bdat = b.elements();
-                        let mut slot = b.grad.write().expect("grad RwLock poisoned");
-                        let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
-                        for (((g, &go), &av), &bv) in gb
-                            .iter_mut()
-                            .zip(gout.iter())
-                            .zip(adat.iter())
-                            .zip(bdat.iter())
-                        {
-                            *g -= go * av / (bv * bv);
-                        }
-                    }
-                }
-            });
-        }
-        out
+        let (lhs, rhs) = broadcast_pair(self, other, "div");
+        elementwise_div(&lhs, &rhs)
     }
 }
 
@@ -523,4 +387,166 @@ impl Div for Tensor {
     fn div(self, other: Tensor) -> Tensor {
         (&self).div(&other)
     }
+}
+
+/// Element-wise `add` on operands already brought to a common shape.
+fn elementwise_add(this: &Tensor, other: &Tensor) -> Tensor {
+    let a_data = this.elements();
+    let b_data = other.elements();
+    let mut out_data = vec![0.0; a_data.len()];
+
+    // Use SIMD operations
+    unsafe {
+        simd::add_f32_simd(&a_data, &b_data, &mut out_data);
+    }
+
+    let mut out = Tensor::new(out_data, &this.shape);
+
+    if this.requires_grad || other.requires_grad {
+        out.requires_grad = true;
+        let a = this.clone();
+        let b = other.clone();
+        let o = out.clone();
+
+        Tape::push_binary_op(this, other, &out, move || {
+            if let Some(gout) = o.grad.read().unwrap().as_ref() {
+                if a.requires_grad {
+                    accumulate_grad(&a, gout);
+                }
+                if b.requires_grad {
+                    accumulate_grad(&b, gout);
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Element-wise `mul` on operands already brought to a common shape.
+fn elementwise_mul(this: &Tensor, other: &Tensor) -> Tensor {
+    let self_data = this.elements();
+    let other_data = other.elements();
+    let mut out_data = vec![0.0; self_data.len()];
+
+    // Use SIMD operations
+    unsafe {
+        simd::mul_f32_simd(&self_data, &other_data, &mut out_data);
+    }
+
+    let mut out = Tensor::new(out_data, &this.shape);
+
+    if this.requires_grad || other.requires_grad {
+        out.requires_grad = true;
+        let a = this.clone();
+        let b = other.clone();
+        let o = out.clone();
+
+        Tape::push_binary_op(this, other, &out, move || {
+            if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+                // d/da (a*b) = b, d/db (a*b) = a. Each branch used to size the
+                // gradient from the *other* operand's data and round-trip
+                // through two scratch buffers; fold it into one pass.
+                if a.requires_grad {
+                    let bdat = b.elements();
+                    let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                    let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
+                    for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
+                        *g += go * bv;
+                    }
+                }
+                if b.requires_grad {
+                    let adat = a.elements();
+                    let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                    let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
+                    for ((g, &go), &av) in gb.iter_mut().zip(gout.iter()).zip(adat.iter()) {
+                        *g += go * av;
+                    }
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Element-wise `sub` on operands already brought to a common shape.
+fn elementwise_sub(this: &Tensor, other: &Tensor) -> Tensor {
+    let self_data = this.elements();
+    let other_data = other.elements();
+    let mut out_data = vec![0.0; self_data.len()];
+
+    // Subtract using SIMD - we can reuse add with negation
+    for i in 0..out_data.len() {
+        out_data[i] = self_data[i] - other_data[i];
+    }
+
+    let mut out = Tensor::new(out_data, &this.shape);
+
+    if this.requires_grad || other.requires_grad {
+        out.requires_grad = true;
+        let a = this.clone();
+        let b = other.clone();
+        let o = out.clone();
+
+        Tape::push_binary_op(this, other, &out, move || {
+            if let Some(gout) = o.grad.read().unwrap().as_ref() {
+                if a.requires_grad {
+                    accumulate_grad(&a, gout);
+                }
+                if b.requires_grad {
+                    accumulate_grad_scaled(&b, gout, -1.0);
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Element-wise `div` on operands already brought to a common shape.
+fn elementwise_div(this: &Tensor, other: &Tensor) -> Tensor {
+    let self_data = this.elements();
+    let other_data = other.elements();
+    let mut out_data = vec![0.0; self_data.len()];
+
+    // Element-wise division
+    for i in 0..out_data.len() {
+        out_data[i] = self_data[i] / other_data[i];
+    }
+
+    let mut out = Tensor::new(out_data, &this.shape);
+
+    if this.requires_grad || other.requires_grad {
+        out.requires_grad = true;
+        let a = this.clone();
+        let b = other.clone();
+        let o = out.clone();
+
+        Tape::push_binary_op(this, other, &out, move || {
+            if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+                // d/da (a/b) = 1/b, d/db (a/b) = -a/b²
+                if a.requires_grad {
+                    let bdat = b.elements();
+                    let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                    let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
+                    for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
+                        *g += go / bv;
+                    }
+                }
+                if b.requires_grad {
+                    let adat = a.elements();
+                    let bdat = b.elements();
+                    let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                    let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
+                    for (((g, &go), &av), &bv) in gb
+                        .iter_mut()
+                        .zip(gout.iter())
+                        .zip(adat.iter())
+                        .zip(bdat.iter())
+                    {
+                        *g -= go * av / (bv * bv);
+                    }
+                }
+            }
+        });
+    }
+    out
 }

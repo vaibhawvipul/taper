@@ -279,7 +279,7 @@ fn checkpoints_round_trip() {
 /// Element-wise ops only checked flat length, so `[2,3] op [3,2]` produced a
 /// result mislabelled with the left operand's shape.
 #[test]
-#[should_panic(expected = "shapes must match")]
+#[should_panic(expected = "do not broadcast")]
 fn elementwise_ops_reject_mismatched_shapes() {
     let a = Tensor::new(vec![1.0; 6], &[2, 3]);
     let b = Tensor::new(vec![1.0; 6], &[3, 2]);
@@ -445,4 +445,49 @@ fn conv2d_gradients_match_finite_differences() {
         xt.grad_ref().is_some_and(|g| g.iter().any(|v| *v != 0.0)),
         "conv2d produced no input gradient"
     );
+}
+
+/// backward() used to replay every node recorded up to the output's id, so two
+/// independent graphs sharing a tape would each run the other's backward pass.
+#[test]
+fn independent_graphs_on_one_tape_do_not_contaminate_each_other() {
+    Tape::reset();
+    let a = Tensor::new(vec![2.0], &[1]).requires_grad();
+    let b = Tensor::new(vec![3.0], &[1]).requires_grad();
+
+    // Two graphs, recorded interleaved onto the same tape.
+    let ga = &a * &a; // depends only on a
+    let gb = &b * &b; // depends only on b
+
+    ga.backward();
+    assert_eq!(a.grad_ref().unwrap().as_slice(), &[4.0], "d(a²)/da = 2a");
+    assert!(
+        b.grad_ref().is_none(),
+        "differentiating a's graph also ran b's backward"
+    );
+
+    gb.backward();
+    assert_eq!(b.grad_ref().unwrap().as_slice(), &[6.0], "d(b²)/db = 2b");
+}
+
+/// Only the ancestors of the output should run. cross_entropy_loss builds a
+/// log_softmax chain it then bypasses, so those nodes are dead weight.
+#[test]
+fn backward_skips_operations_the_output_does_not_depend_on() {
+    Tape::reset();
+    let x = Tensor::new(vec![1.0, 2.0], &[2]).requires_grad();
+
+    let used = &x + &x;
+    // A side branch that nothing downstream consumes.
+    let _unused = (&x * &x).exp().log();
+    let recorded = Tape::len();
+
+    used.backward();
+
+    assert!(
+        recorded > 2,
+        "expected the unused branch to be on the tape, got {recorded} nodes"
+    );
+    // d(2x)/dx = 2 exactly; had the side branch run, it would have added to x.
+    assert_eq!(x.grad_ref().unwrap().as_slice(), &[2.0, 2.0]);
 }
