@@ -279,7 +279,7 @@ fn checkpoints_round_trip() {
 /// Element-wise ops only checked flat length, so `[2,3] op [3,2]` produced a
 /// result mislabelled with the left operand's shape.
 #[test]
-#[should_panic(expected = "shapes must match")]
+#[should_panic(expected = "do not broadcast")]
 fn elementwise_ops_reject_mismatched_shapes() {
     let a = Tensor::new(vec![1.0; 6], &[2, 3]);
     let b = Tensor::new(vec![1.0; 6], &[3, 2]);
