@@ -1,4 +1,8 @@
 use crate::Tensor;
+use crate::data::Dataset;
+
+/// Re-exported for compatibility; `DataLoader` is generic over any [`Dataset`].
+pub use crate::data::DataLoader;
 use std::fs::{File, create_dir_all};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -272,40 +276,9 @@ impl MNISTDataset {
         Ok(Tensor::new(labels, &[num_labels]))
     }
 
-    /// Get a batch of samples by indices (parallelized with Rayon)
-    pub fn get_batch(&self, indices: &[usize]) -> (Tensor, Tensor) {
-        let batch_size = indices.len();
-
-        // preallocate exact sizes
-        let mut batch_images = vec![0.0f32; batch_size * 784];
-        let mut batch_labels = vec![0.0f32; batch_size];
-
-        // hold read guards once
-        let images_data_guard = self.images.data();
-        let labels_data_guard = self.labels.data();
-        let images_data: &[f32] = &images_data_guard;
-        let labels_data: &[f32] = &labels_data_guard;
-
-        // copy images in parallel: each chunk writes to a disjoint [i*784 .. (i+1)*784)
-        batch_images
-            .par_chunks_mut(784)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let idx = indices[i];
-                let src = &images_data[idx * 784..idx * 784 + 784];
-                // safe: disjoint writes per i
-                dst.copy_from_slice(src);
-            });
-
-        // copy labels in parallel
-        batch_labels.par_iter_mut().enumerate().for_each(|(i, y)| {
-            *y = labels_data[indices[i]];
-        });
-
-        (
-            Tensor::new(batch_images, &[batch_size, 784]),
-            Tensor::new(batch_labels, &[batch_size]),
-        )
+    /// Number of pixels per image, taken from the data rather than assumed.
+    fn features(&self) -> usize {
+        self.images.shape()[1]
     }
 
     /// Get the size of the dataset
@@ -327,64 +300,40 @@ impl MNISTDataset {
     }
 }
 
-// Keep the DataLoader implementation the same as before
-pub struct DataLoader {
-    dataset: MNISTDataset,
-    batch_size: usize,
-    shuffle: bool,
-    indices: Vec<usize>,
-    current: usize,
-}
-
-impl DataLoader {
-    pub fn new(dataset: MNISTDataset, batch_size: usize, shuffle: bool) -> Self {
-        let n = dataset.len();
-        let mut indices: Vec<usize> = (0..n).collect();
-
-        if shuffle {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            indices.shuffle(&mut rng);
-        }
-
-        DataLoader {
-            dataset,
-            batch_size,
-            shuffle,
-            indices,
-            current: 0,
-        }
+impl Dataset for MNISTDataset {
+    fn len(&self) -> usize {
+        self.labels.shape()[0]
     }
 
-    pub fn reset(&mut self) {
-        self.current = 0;
+    /// Copies the batch in parallel; each destination chunk is disjoint.
+    fn get_batch(&self, indices: &[usize]) -> (Tensor, Tensor) {
+        let batch_size = indices.len();
+        let features = self.features();
 
-        if self.shuffle {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            self.indices.shuffle(&mut rng);
-        }
-    }
+        let mut batch_images = vec![0.0f32; batch_size * features];
+        let mut batch_labels = vec![0.0f32; batch_size];
 
-    pub fn num_batches(&self) -> usize {
-        self.dataset.len().div_ceil(self.batch_size)
-    }
-}
+        // hold read guards once
+        let images_data_guard = self.images.data();
+        let labels_data_guard = self.labels.data();
+        let images_data: &[f32] = &images_data_guard;
+        let labels_data: &[f32] = &labels_data_guard;
 
-impl Iterator for DataLoader {
-    type Item = (Tensor, Tensor);
+        batch_images
+            .par_chunks_mut(features)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let idx = indices[i];
+                dst.copy_from_slice(&images_data[idx * features..idx * features + features]);
+            });
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.dataset.len() {
-            return None;
-        }
+        batch_labels.par_iter_mut().enumerate().for_each(|(i, y)| {
+            *y = labels_data[indices[i]];
+        });
 
-        let end = (self.current + self.batch_size).min(self.dataset.len());
-        let batch_indices = &self.indices[self.current..end];
-
-        let batch = self.dataset.get_batch(batch_indices);
-        self.current = end;
-
-        Some(batch)
+        (
+            Tensor::new(batch_images, &[batch_size, features]),
+            Tensor::new(batch_labels, &[batch_size]),
+        )
     }
 }
