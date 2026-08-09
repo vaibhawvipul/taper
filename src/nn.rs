@@ -11,6 +11,17 @@ pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
 
+    /// Non-learnable state that must persist across save/load but must never
+    /// be handed to an optimizer — BatchNorm's running statistics, for example.
+    ///
+    /// These are observations, not weights: applying momentum and weight decay
+    /// to them would make them drift instead of tracking the data, while
+    /// leaving them out of checkpoints entirely would make a reloaded model
+    /// normalize with reset statistics.
+    fn buffers(&self) -> Vec<Tensor> {
+        Vec::new()
+    }
+
     /// Switch this module (and any children) between training and inference
     /// behaviour. Layers whose forward pass is mode-independent can ignore it.
     ///
@@ -160,6 +171,10 @@ impl Sequential {
 impl Module for Sequential {
     fn forward(&self, input: &Tensor) -> Tensor {
         self.layers.iter().fold(input.clone(), |x, l| l.forward(&x))
+    }
+
+    fn buffers(&self) -> Vec<Tensor> {
+        self.layers.iter().flat_map(|l| l.buffers()).collect()
     }
 
     fn set_training(&mut self, training: bool) {
