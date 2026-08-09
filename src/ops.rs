@@ -174,8 +174,8 @@ impl Tensor {
             n_out,
             k,
             1.0,
-            &a_store[a.offset..],
-            &b_store[b.offset..],
+            &a_store.as_f32_slice()[a.offset..],
+            &b_store.as_f32_slice()[b.offset..],
             0.0,
             &mut c,
         );
@@ -216,7 +216,7 @@ impl Tensor {
                             n_out,
                             1.0,
                             gout,
-                            &b_store[b_op.offset..],
+                            &b_store.as_f32_slice()[b_op.offset..],
                             1.0,
                             ga,
                         );
@@ -239,7 +239,7 @@ impl Tensor {
                             n_out,
                             m,
                             1.0,
-                            &a_store[a_op.offset..],
+                            &a_store.as_f32_slice()[a_op.offset..],
                             gout,
                             1.0,
                             gb,
