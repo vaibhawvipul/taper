@@ -104,6 +104,22 @@ impl Tape {
         Self::push(&[input], output, backward_fn);
     }
 
+    /// Record an operation with any number of inputs.
+    ///
+    /// Every input that is itself the output of an earlier operation must be
+    /// listed, or `backward` will not reach that operation: the dependency walk
+    /// follows exactly these edges. Declaring only one input of an n-ary op
+    /// silently drops the others' subgraphs.
+    pub fn push_op<F>(inputs: &[&Tensor], output: &Tensor, backward_fn: F)
+    where
+        F: Fn() + 'static,
+    {
+        if !inputs.iter().any(|t| t.requires_grad) {
+            return;
+        }
+        Self::push(inputs, output, backward_fn);
+    }
+
     fn push<F>(inputs: &[&Tensor], output: &Tensor, backward_fn: F)
     where
         F: Fn() + 'static,

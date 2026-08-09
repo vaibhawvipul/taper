@@ -997,14 +997,17 @@ impl Tensor {
 
         // `cat` had no backward edge at all, so grouped convolution — its only
         // caller — could never propagate gradients past the concatenation.
-        if let Some(anchor) = tensors.iter().find(|t| t.requires_grad) {
+        if tensors.iter().any(|t| t.requires_grad) {
             output.requires_grad = true;
             let inputs: Vec<Tensor> = tensors.to_vec();
             let out = output.clone();
 
-            // Anchor on a tensor that actually requires grad: `push_unary_op`
-            // drops the node otherwise, and the first input may not be the one.
-            crate::tape::Tape::push_unary_op(anchor, &output, move || {
+            // Every input must be declared as a dependency. Naming just one —
+            // as this did — left the other inputs' subgraphs unreachable from
+            // the output, so in a grouped convolution only the first group's
+            // weights ever received a gradient.
+            let parents: Vec<&Tensor> = tensors.iter().collect();
+            crate::tape::Tape::push_op(&parents, &output, move || {
                 if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
                     for (tensor, positions) in inputs.iter().zip(source_positions.iter()) {
                         if !tensor.requires_grad {
