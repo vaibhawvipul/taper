@@ -29,20 +29,27 @@ pub mod simd {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub const SIMD_WIDTH: usize = 1;
 
-    // Cross-platform SIMD operations
+    /// Element-wise `out = a + b`.
+    ///
+    /// # Safety
+    /// The three slices must all have the same length; the vectorized kernels
+    /// index `b` and `out` using `a.len()` without further bounds checks.
     #[inline(always)]
     pub unsafe fn add_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
+        assert_eq!(a.len(), b.len(), "add_f32_simd: operand lengths differ");
+        assert_eq!(a.len(), out.len(), "add_f32_simd: output length differs");
+
         #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
         {
             if is_x86_feature_detected!("avx") {
-                add_f32_avx(a, b, out);
+                unsafe { add_f32_avx(a, b, out) };
                 return;
             }
         }
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
         {
-            if is_x86_feature_detected!("sse2") {
+            if is_x86_feature_detected!("sse") {
                 unsafe {
                     add_f32_sse(a, b, out);
                 }
@@ -55,6 +62,11 @@ pub mod simd {
             unsafe { add_f32_neon(a, b, out) };
             return;
         }
+
+        // Targets without a vectorized kernel must still compute the right
+        // answer; falling through here used to leave `out` untouched (all zeros).
+        #[allow(unreachable_code)]
+        add_f32_scalar(a, b, out);
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
@@ -107,20 +119,27 @@ pub mod simd {
         }
     }
 
-    #[allow(dead_code)]
+    #[inline]
     fn add_f32_scalar(a: &[f32], b: &[f32], out: &mut [f32]) {
-        for i in 0..a.len() {
-            out[i] = a[i] + b[i];
+        for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+            *o = x + y;
         }
     }
 
-    // Multiplication operations
+    /// Element-wise `out = a * b`.
+    ///
+    /// # Safety
+    /// The three slices must all have the same length; the vectorized kernels
+    /// index `b` and `out` using `a.len()` without further bounds checks.
     #[inline(always)]
     pub unsafe fn mul_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
+        assert_eq!(a.len(), b.len(), "mul_f32_simd: operand lengths differ");
+        assert_eq!(a.len(), out.len(), "mul_f32_simd: output length differs");
+
         #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
         {
             if is_x86_feature_detected!("avx") {
-                mul_f32_avx(a, b, out);
+                unsafe { mul_f32_avx(a, b, out) };
                 return;
             }
         }
@@ -140,6 +159,9 @@ pub mod simd {
             unsafe { mul_f32_neon(a, b, out) };
             return;
         }
+
+        #[allow(unreachable_code)]
+        mul_f32_scalar(a, b, out);
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
@@ -189,44 +211,52 @@ pub mod simd {
         }
     }
 
-    #[allow(dead_code)]
+    #[inline]
     fn mul_f32_scalar(a: &[f32], b: &[f32], out: &mut [f32]) {
-        for i in 0..a.len() {
-            out[i] = a[i] * b[i];
+        for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+            *o = x * y;
         }
     }
 
-    // FMA operations for matmul
+    /// Element-wise `acc += a + b`, without the temporary the caller would
+    /// otherwise need to hold the sum before copying it back.
+    ///
+    /// # Safety
+    /// `acc` and `src` must have the same length.
     #[inline(always)]
-    pub unsafe fn fma_f32_simd(a: f32, b: &[f32], c: &mut [f32]) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    pub unsafe fn add_assign_f32_simd(acc: &mut [f32], src: &[f32]) {
+        assert_eq!(
+            acc.len(),
+            src.len(),
+            "add_assign_f32_simd: operand lengths differ"
+        );
+
+        #[cfg(target_arch = "aarch64")]
         {
-            if is_x86_feature_detected!("fma") {
-                fma_f32_avx(a, b, c);
-                return;
+            unsafe { add_assign_f32_neon(acc, src) };
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        for (a, &s) in acc.iter_mut().zip(src) {
+            *a += s;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn add_assign_f32_neon(acc: &mut [f32], src: &[f32]) {
+        let chunks = acc.len() / 4;
+        for i in 0..chunks {
+            let idx = i * 4;
+            unsafe {
+                let va = vld1q_f32(acc.as_ptr().add(idx));
+                let vb = vld1q_f32(src.as_ptr().add(idx));
+                vst1q_f32(acc.as_mut_ptr().add(idx), vaddq_f32(va, vb));
             }
         }
-
-        // Fallback to mul-add
-        for i in 0..b.len() {
-            c[i] += a * b[i];
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "fma"))]
-    #[target_feature(enable = "avx,fma")]
-    unsafe fn fma_f32_avx(a: f32, b: &[f32], c: &mut [f32]) {
-        let va = _mm256_set1_ps(a);
-        let chunks = b.len() / 8;
-        for i in 0..chunks {
-            let idx = i * 8;
-            let vb = _mm256_loadu_ps(b.as_ptr().add(idx));
-            let vc = _mm256_loadu_ps(c.as_ptr().add(idx));
-            let result = _mm256_fmadd_ps(va, vb, vc);
-            _mm256_storeu_ps(c.as_mut_ptr().add(idx), result);
-        }
-        for i in (chunks * 8)..b.len() {
-            c[i] += a * b[i];
+        for i in (chunks * 4)..acc.len() {
+            acc[i] += src[i];
         }
     }
 }
@@ -256,21 +286,19 @@ pub enum QuantizedTensor {
     NF4(NF4Tensor),
 }
 
-/// Int8 quantized tensor
+/// Int8 quantized tensor. Values dequantize as `(q - zero_point) * scale`.
 #[derive(Clone, Debug)]
 pub struct Int8Tensor {
     data: Arc<RwLock<Vec<i8>>>,
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
-    min_val: f32, // Minimum value in original data
 }
 
 /// Int4 quantized tensor (packed representation - 2 values per byte)
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct Int4Tensor {
-    data: Arc<RwLock<Vec<u8>>>, // Packed: 2 int4 values per u8
+    data: Arc<RwLock<Vec<u8>>>, // Packed: 2 int4 values per u8, low nibble first
     shape: SmallVec<[usize; 4]>,
     scale: f32,
     zero_point: i32,
@@ -290,14 +318,58 @@ pub struct BFloat16Tensor {
     shape: SmallVec<[usize; 4]>,
 }
 
-/// NF4 quantized tensor
-#[allow(dead_code)]
+/// NF4 quantized tensor: 4-bit codes into [`NF4_LEVELS`], scaled by `absmax`.
 #[derive(Clone, Debug)]
 pub struct NF4Tensor {
-    data: Arc<RwLock<Vec<u8>>>, // Packed NF4 values
+    data: Arc<RwLock<Vec<u8>>>, // Packed NF4 codes, 2 per byte, low nibble first
     shape: SmallVec<[usize; 4]>,
-    scale: f32,
-    zero_point: i32,
+    absmax: f32,
+}
+
+/// The 16 NF4 quantization levels (normal-float 4-bit, as used by QLoRA).
+/// Levels are information-theoretically optimal for normally distributed
+/// weights and are asymmetric, so NF4 carries a scale but no zero point.
+pub const NF4_LEVELS: [f32; 16] = [
+    -1.0,
+    -0.696_192_8,
+    -0.525_073_05,
+    -0.394_917_5,
+    -0.284_441_38,
+    -0.184_773_43,
+    -0.091_050_04,
+    0.0,
+    0.079_580_3,
+    0.160_930_2,
+    0.246_112_3,
+    0.337_915_24,
+    0.440_709_83,
+    0.562_617,
+    0.722_956_84,
+    1.0,
+];
+
+/// Pack signed 4-bit codes (already offset into `0..16`) two per byte.
+fn pack_nibbles(codes: &[u8]) -> Vec<u8> {
+    let mut packed = vec![0u8; codes.len().div_ceil(2)];
+    for (i, &code) in codes.iter().enumerate() {
+        let nibble = code & 0x0F;
+        if i % 2 == 0 {
+            packed[i / 2] |= nibble;
+        } else {
+            packed[i / 2] |= nibble << 4;
+        }
+    }
+    packed
+}
+
+/// Inverse of [`pack_nibbles`]; `numel` disambiguates the padded odd case.
+fn unpack_nibbles(packed: &[u8], numel: usize) -> Vec<u8> {
+    (0..numel)
+        .map(|i| {
+            let byte = packed[i / 2];
+            if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for Tensor {
@@ -344,7 +416,6 @@ impl Int8Tensor {
             shape,
             scale,
             zero_point,
-            min_val: 0.0, // Placeholder, should be set during quantization
         }
     }
 
@@ -352,7 +423,7 @@ impl Int8Tensor {
         let data = self.data();
         let f32_data: Vec<f32> = data
             .iter()
-            .map(|&q| (q as i32 - self.zero_point) as f32 * self.scale + self.min_val)
+            .map(|&q| (q as i32 - self.zero_point) as f32 * self.scale)
             .collect();
 
         Tensor::new(f32_data, &self.shape)
@@ -382,13 +453,27 @@ impl Int4Tensor {
     }
 
     pub fn dequantize(&self) -> Tensor {
-        unimplemented!(
-            "Int4 dequantization not yet implemented: unpacking and scale/zero_point conversion needed"
-        )
+        let numel: usize = self.shape.iter().product();
+        let packed = self.data();
+        let f32_data: Vec<f32> = unpack_nibbles(&packed, numel)
+            .into_iter()
+            // Nibbles store `q + 8` so the signed range [-8, 7] fits in [0, 15].
+            .map(|code| (code as i32 - 8 - self.zero_point) as f32 * self.scale)
+            .collect();
+
+        Tensor::new(f32_data, &self.shape)
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
         self.data.read().expect("Int4Tensor data lock poisoned")
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    pub fn zero_point(&self) -> i32 {
+        self.zero_point
     }
 }
 
@@ -427,8 +512,18 @@ impl BFloat16Tensor {
         }
     }
 
+    /// Create a bfloat16 tensor from an f32 tensor.
+    pub fn from_f32_tensor(tensor: &Tensor) -> Self {
+        let data = tensor.data();
+        let bf16_data: Vec<u16> = data.iter().map(|&x| Tensor::f32_to_bf16(x)).collect();
+        Self::new(bf16_data, tensor.shape.clone())
+    }
+
     pub fn dequantize(&self) -> Tensor {
-        unimplemented!("BFloat16 dequantization not yet implemented: bf16-to-f32 conversion needed")
+        let data = self.data();
+        let f32_data: Vec<f32> = data.iter().map(|&x| Tensor::bf16_to_f32(x)).collect();
+
+        Tensor::new(f32_data, &self.shape)
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u16>> {
@@ -437,35 +532,57 @@ impl BFloat16Tensor {
 }
 
 impl NF4Tensor {
-    pub fn new(data: Vec<u8>, shape: SmallVec<[usize; 4]>, scale: f32, zero_point: i32) -> Self {
+    pub fn new(data: Vec<u8>, shape: SmallVec<[usize; 4]>, absmax: f32) -> Self {
         Self {
             data: Arc::new(RwLock::new(data)),
             shape,
-            scale,
-            zero_point,
+            absmax,
         }
     }
 
     pub fn dequantize(&self) -> Tensor {
-        unimplemented!(
-            "NF4 dequantization not yet implemented: NF4 unpacking and lookup table conversion needed"
-        )
+        let numel: usize = self.shape.iter().product();
+        let packed = self.data();
+        let f32_data: Vec<f32> = unpack_nibbles(&packed, numel)
+            .into_iter()
+            .map(|code| NF4_LEVELS[code as usize] * self.absmax)
+            .collect();
+
+        Tensor::new(f32_data, &self.shape)
     }
 
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
         self.data.read().expect("NF4Tensor data lock poisoned")
     }
+
+    /// The absolute-maximum scale the 4-bit codes are normalized against.
+    pub fn absmax(&self) -> f32 {
+        self.absmax
+    }
 }
 
 impl Tensor {
     pub fn new(data: Vec<f32>, shape: &[usize]) -> Self {
+        let expected: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            expected,
+            "Tensor::new: {} values do not fill shape {:?}",
+            data.len(),
+            shape
+        );
         Tensor {
             data: Arc::new(RwLock::new(data)),
             shape: shape.iter().cloned().collect(),
             grad: Arc::new(RwLock::new(None)),
             requires_grad: false,
-            tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(crate::tape::NO_NODE)),
         }
+    }
+
+    /// Total number of elements.
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
     }
 
     pub fn scalar(value: f32) -> Self {
@@ -491,11 +608,21 @@ impl Tensor {
         self.data.write().expect("data RwLock poisoned")
     }
 
-    /// Read-only view of grad vector if it exists
+    /// Read-only view of grad vector if it exists.
+    ///
+    /// This copies the gradient. Prefer [`Tensor::with_grad`] on hot paths such
+    /// as optimizer steps, which borrows it under the lock instead.
     #[inline]
     pub fn grad_ref(&self) -> Option<std::sync::Arc<Vec<f32>>> {
         let g = self.grad.read().expect("grad RwLock poisoned");
         g.as_ref().map(|v| std::sync::Arc::new(v.clone()))
+    }
+
+    /// Borrow the gradient under the read lock, returning `None` if unset.
+    #[inline]
+    pub fn with_grad<R>(&self, f: impl FnOnce(&[f32]) -> R) -> Option<R> {
+        let g = self.grad.read().expect("grad RwLock poisoned");
+        g.as_ref().map(|v| f(v))
     }
 
     /// Convenience: clone grads into a new non-requiring-grad Tensor
@@ -510,25 +637,15 @@ impl Tensor {
 
     pub fn backward(&self) {
         let ones = vec![1.0; self.data().len()];
-        *self.grad.write().unwrap() = Some(ones);
+        *self.grad.write().expect("grad RwLock poisoned") = Some(ones);
 
-        // Use AtomicUsize::load; define a sentinel like 0 = “no node”
-        let node_id = self.tape_node.load(Ordering::SeqCst);
-        if node_id != 0 {
-            crate::tape::backward(node_id);
-        }
+        // `NO_NODE` (not 0) marks a tensor that is not the output of a recorded
+        // op — node ids are indices and legitimately start at 0.
+        crate::tape::backward(self.tape_node.load(Ordering::SeqCst));
     }
 
     pub fn zero_grad(&self) {
-        *self.grad.write().unwrap() = None;
-    }
-
-    pub fn from_data(&self, data: Vec<f32>, shape: &[usize]) -> Tensor {
-        let mut tensor = Tensor::new(data, shape);
-        if self.requires_grad {
-            tensor.requires_grad = true;
-        }
-        tensor
+        *self.grad.write().expect("grad RwLock poisoned") = None;
     }
 
     /// Cache-friendly blocked transpose
@@ -743,13 +860,9 @@ impl Tensor {
                     if r.requires_grad {
                         let (b, c) = (a.shape[0], a.shape[1]);
                         let mut grad_r = vec![0.0; b];
-                        for row in 0..b {
+                        for (row, g) in grad_r.iter_mut().enumerate() {
                             let base = row * c;
-                            let mut s = 0.0;
-                            for col in 0..c {
-                                s += gout[base + col];
-                            }
-                            grad_r[row] -= s;
+                            *g -= gout[base..base + c].iter().sum::<f32>();
                         }
                         ops::accumulate_grad(&r, &grad_r);
                     }
@@ -1014,8 +1127,6 @@ impl Tensor {
                 let out = output.clone();
                 let in_shape = self.shape.clone();
                 let out_shape_captured = out_shape.clone();
-                let keepdim = keepdim;
-                let d = d;
 
                 Tape::push_unary_op(self, &output, move || {
                     if let Some(gout) = out.grad.read().unwrap().as_ref() {
@@ -1027,7 +1138,7 @@ impl Tensor {
 
                         // Gradient is broadcasted back
                         // Each element that was summed gets the same gradient
-                        for i in 0..gin.len() {
+                        for (i, g) in gin.iter_mut().enumerate() {
                             // Calculate which output element this came from
                             let mut idx = i;
                             let mut out_idx = 0;
@@ -1052,7 +1163,7 @@ impl Tensor {
                                 out_idx,
                                 gout.len()
                             );
-                            gin[i] += gout[out_idx];
+                            *g += gout[out_idx];
                         }
                     }
                 });
@@ -1099,12 +1210,6 @@ impl Tensor {
             let mut max_values = vec![f32::NEG_INFINITY; out_size];
             let mut max_indices = vec![0.0; out_size];
 
-            // Calculate strides
-            let mut strides = vec![1; self.shape.len()];
-            for i in (0..self.shape.len() - 1).rev() {
-                strides[i] = strides[i + 1] * self.shape[i + 1];
-            }
-
             // Find max values and indices
             for i in 0..data.len() {
                 let mut idx = i;
@@ -1112,6 +1217,11 @@ impl Tensor {
                 let mut dim_idx = 0;
                 let mut multiplier = 1;
 
+                // Walk dimensions from fastest- to slowest-varying, skipping `d`
+                // (whose extent in the output is 1). Every retained dimension
+                // must advance the multiplier, not just those below `d` — the
+                // old `if j < d` guard collapsed distinct outputs onto the same
+                // slot for any `d` that was not the last dimension.
                 for j in (0..self.shape.len()).rev() {
                     let coord = idx % self.shape[j];
                     idx /= self.shape[j];
@@ -1120,11 +1230,11 @@ impl Tensor {
                         dim_idx = coord;
                     } else {
                         out_idx += coord * multiplier;
-                        multiplier *= if j < d { self.shape[j] } else { 1 };
+                        multiplier *= self.shape[j];
                     }
                 }
 
-                out_idx = out_idx.min(out_size - 1);
+                debug_assert!(out_idx < out_size, "max: output index out of range");
 
                 if data[i] > max_values[out_idx] {
                     max_values[out_idx] = data[i];
@@ -1141,7 +1251,6 @@ impl Tensor {
                 let out = values.clone();
                 let in_shape = self.shape.clone();
                 let out_shape = out_shape.clone();
-                let d = d;
 
                 Tape::push_unary_op(self, &values, move || {
                     if let Some(gout) = out.grad.read().unwrap().as_ref() {
@@ -1152,23 +1261,21 @@ impl Tensor {
                         }
                         let gin = slot.as_mut().unwrap();
 
+                        // Strides depend only on the shapes, so build them once
+                        // rather than reallocating two Vecs per output element.
+                        let mut in_strides = vec![1usize; in_shape.len()];
+                        for j in (0..in_shape.len().saturating_sub(1)).rev() {
+                            in_strides[j] = in_strides[j + 1] * in_shape[j + 1];
+                        }
+                        let mut out_strides = vec![1usize; out_shape.len()];
+                        for j in (0..out_shape.len().saturating_sub(1)).rev() {
+                            out_strides[j] = out_strides[j + 1] * out_shape[j + 1];
+                        }
+
                         // For each output element, scatter gradient to the argmax position
                         let out_size = gout.len();
                         for oi in 0..out_size {
                             let dim_idx = max_indices[oi] as usize;
-
-                            // Convert flat out_idx to coordinates in out_shape
-                            // Compute input strides
-                            let mut in_strides = vec![1usize; in_shape.len()];
-                            for j in (0..in_shape.len() - 1).rev() {
-                                in_strides[j] = in_strides[j + 1] * in_shape[j + 1];
-                            }
-
-                            // Compute output strides
-                            let mut out_strides = vec![1usize; out_shape.len()];
-                            for j in (0..out_shape.len() - 1).rev() {
-                                out_strides[j] = out_strides[j + 1] * out_shape[j + 1];
-                            }
 
                             // Decompose out_idx into coords, replace dim d with argmax
                             let mut in_flat = 0;
@@ -1189,13 +1296,15 @@ impl Tensor {
 
             (values, indices)
         } else {
-            // Global max
+            // Global max. `total_cmp` keeps this total (and panic-free) on NaN,
+            // where `partial_cmp().unwrap()` would abort the process.
+            assert!(!data.is_empty(), "max: cannot reduce an empty tensor");
             let (max_val, max_idx) = data
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map(|(i, &v)| (v, i))
-                .unwrap_or((0.0, 0));
+                .expect("non-empty");
 
             let mut values = Tensor::scalar(max_val);
             let indices = Tensor::scalar(max_idx as f32);
@@ -1204,7 +1313,6 @@ impl Tensor {
                 values.requires_grad = true;
                 let input = self.clone();
                 let out = values.clone();
-                let max_idx = max_idx;
 
                 Tape::push_unary_op(self, &values, move || {
                     if let Some(gout) = out.grad.read().unwrap().as_ref() {
@@ -1259,7 +1367,7 @@ impl Tensor {
                     // Use SIMD for gradient computation
                     unsafe {
                         let mut temp = vec![0.0; gin.len()];
-                        crate::tensor::simd::mul_f32_simd(gout, &exp_x, &mut temp);
+                        crate::tensor::simd::mul_f32_simd(gout, exp_x, &mut temp);
                         let gin_buf = gin.clone();
                         let mut result_buf = vec![0.0; gin_buf.len()];
                         crate::tensor::simd::add_f32_simd(&gin_buf, &temp, &mut result_buf);
@@ -1323,7 +1431,6 @@ impl Tensor {
             output.requires_grad = true;
             let input = self.clone();
             let out = output.clone();
-            let exp = exp;
 
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out.grad.read().unwrap().as_ref() {
@@ -1398,18 +1505,17 @@ impl Tensor {
         let k = c_in * k_h * k_w;
         let col_matrix = self.im2col_optimized(k_h, k_w, stride, padding, dilation); // [NW, K]
 
-        // reshape weights as [K, C_out] (no transpose needed)
-        let weight_reshaped = weight.reshape(&[k, c_out]);
+        // Weight is [C_out, C_in, K_h, K_w] in row-major order, so flattening it
+        // gives [C_out, K]. Reshaping straight to [K, C_out] instead — as this
+        // did, "no transpose needed" — reinterprets the buffer rather than
+        // transposing it, pairing each column with the wrong filter whenever
+        // both C_out and K exceed 1. The transpose is over the weights only, so
+        // it is negligible next to the GEMM.
+        let weight_reshaped = weight.reshape(&[c_out, k]).transpose();
 
-        // now: [NW, K] @ [K, C_out] -> [NW, C_out], zero extra copy
-        let output_2d = col_matrix.matmul(&weight_reshaped);
+        // now: [NW, K] @ [K, C_out] -> [NW, C_out]
         // col_matrix shape: [N * H_out * W_out, C_in * K_h * K_w]
-
-        // Reshape weight for GEMM: [C_out, C_in * K_h * K_w]
-        // let weight_reshaped = weight.reshape(&[c_out, c_in * k_h * k_w]);
-
-        // // GEMM: [N * H_out * W_out, C_out] = [N * H_out * W_out, C_in * K_h * K_w] @ [C_in * K_h * K_w, C_out]
-        // let output_2d = col_matrix.matmul(&weight_reshaped.transpose());
+        let output_2d = col_matrix.matmul(&weight_reshaped);
 
         // Reshape back to 4D: [N, H_out, W_out, C_out] -> [N, C_out, H_out, W_out]
         let mut output = output_2d.reshape(&[n, h_out, w_out, c_out]);
@@ -1422,97 +1528,6 @@ impl Tensor {
         }
 
         output
-    }
-
-    pub fn conv2d_direct_3x3(
-        &self,
-        weight: &Tensor,
-        bias: Option<&Tensor>,
-        stride: (usize, usize),
-        padding: (usize, usize),
-    ) -> Tensor {
-        use rayon::prelude::*;
-
-        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let (c_out, _, _, _) = (
-            weight.shape[0],
-            weight.shape[1],
-            weight.shape[2],
-            weight.shape[3],
-        );
-
-        let (stride_h, stride_w) = stride;
-        let (pad_h, pad_w) = padding;
-
-        let h_out = (h_in + 2 * pad_h - 2) / stride_h + 1;
-        let w_out = (w_in + 2 * pad_w - 2) / stride_w + 1;
-
-        let input_data = self.data().clone();
-        let weight_data = weight.data().clone();
-        let mut output = vec![0.0; n * c_out * h_out * w_out];
-
-        // Parallel over batch and output channels
-        output
-            .par_chunks_mut(h_out * w_out)
-            .enumerate()
-            .for_each(|(idx, out_spatial)| {
-                let batch = idx / c_out;
-                let out_ch = idx % c_out;
-
-                // For each output position
-                for oh in 0..h_out {
-                    for ow in 0..w_out {
-                        let mut sum = 0.0;
-
-                        // Convolution kernel - unrolled for 3x3
-                        for in_ch in 0..c_in {
-                            let weight_base = (out_ch * c_in + in_ch) * 9;
-                            let input_base = batch * c_in * h_in * w_in + in_ch * h_in * w_in;
-
-                            // Unrolled 3x3 loop with bounds checking hoisted
-                            for kh in 0..3 {
-                                let ih = oh * stride_h + kh;
-                                if ih < pad_h || ih >= h_in + pad_h {
-                                    continue;
-                                }
-                                let ih_idx = ih - pad_h;
-
-                                for kw in 0..3 {
-                                    let iw = ow * stride_w + kw;
-                                    if iw < pad_w || iw >= w_in + pad_w {
-                                        continue;
-                                    }
-                                    let iw_idx = iw - pad_w;
-
-                                    let in_idx = input_base + ih_idx * w_in + iw_idx;
-                                    let w_idx = weight_base + kh * 3 + kw;
-
-                                    sum += input_data[in_idx] * weight_data[w_idx];
-                                }
-                            }
-                        }
-
-                        out_spatial[oh * w_out + ow] = sum;
-                    }
-                }
-            });
-
-        // Add bias if provided
-        if let Some(b) = bias {
-            let bias_data = b.data().clone();
-            output
-                .par_chunks_mut(h_out * w_out)
-                .enumerate()
-                .for_each(|(idx, out_spatial)| {
-                    let out_ch = idx % c_out;
-                    let bias_val = bias_data[out_ch];
-                    for v in out_spatial.iter_mut() {
-                        *v += bias_val;
-                    }
-                });
-        }
-
-        Tensor::new(output, &[n, c_out, h_out, w_out])
     }
 
     /// Fused convolution + ReLU operation for better performance
@@ -1738,8 +1753,6 @@ impl Tensor {
             let input = self.clone();
             let (n, c, h_in, w_in, h_out, w_out) = (n, c, h_in, w_in, h_out, w_out);
             let (k_h, k_w, s_h, s_w, pad_h, pad_w) = (k_h, k_w, s_h, s_w, pad_h, pad_w);
-            let out_spatial = out_spatial;
-            let pool_size = pool_size;
 
             Tape::push_unary_op(self, &output, move || {
                 if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
@@ -1799,7 +1812,15 @@ impl Tensor {
         output
     }
 
-    /// SIMD-optimized im2col transformation
+    /// im2col: `[N, C, H, W]` -> `[N*H_out*W_out, C*K_h*K_w]`.
+    ///
+    /// This replaces three hand-specialized paths (3x3-stride-1, 1x1, and a
+    /// "consecutive run" general case). They were not equivalent to each other:
+    /// the 1x1 path was a straight memcpy, which only matches the column layout
+    /// when `H*W == 1`, and the general path computed
+    /// `out_w * stride + k * dil - pad` in `usize`, underflowing for any padded
+    /// window that starts left of the image. One clear indexed loop is both
+    /// correct and parallel.
     fn im2col_optimized(
         &self,
         k_h: usize,
@@ -1817,300 +1838,93 @@ impl Tensor {
         let w_out = (w_in + 2 * pad_w - dil_w * (k_w - 1) - 1) / stride_w + 1;
 
         let col_size = c * k_h * k_w;
-        let num_windows = n * h_out * w_out;
+        let spatial = h_out * w_out;
+        let num_windows = n * spatial;
         let mut col_data = vec![0.0; num_windows * col_size];
 
         let data = self.data().clone(); // Clone once to avoid lock contention
 
-        // Special cases remain the same
-        if k_h == 3 && k_w == 3 && stride_h == 1 && stride_w == 1 && dil_h == 1 && dil_w == 1 {
-            // Parallelize the 3x3 case
-            self.im2col_3x3_stride1_parallel(
-                &data,
-                &mut col_data,
-                n,
-                c,
-                h_in,
-                w_in,
-                h_out,
-                w_out,
-                pad_h,
-                pad_w,
-            );
-        } else if k_h == 1 && k_w == 1 {
-            // 1x1 is already optimal
-            self.im2col_1x1(&data, &mut col_data, n, c, h_in, w_in, h_out, w_out);
-        } else {
-            // Parallelize general case
-            self.im2col_general_simd(
-                &data,
-                &mut col_data,
-                n,
-                c,
-                h_in,
-                w_in,
-                h_out,
-                w_out,
-                k_h,
-                k_w,
-                stride_h,
-                stride_w,
-                pad_h,
-                pad_w,
-                dil_h,
-                dil_w,
-            );
-        }
-
-        Tensor::new(col_data, &[num_windows, col_size])
-    }
-
-    fn im2col_3x3_stride1_parallel(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        _n: usize,
-        c: usize,
-        h_in: usize,
-        w_in: usize,
-        h_out: usize,
-        w_out: usize,
-        pad_h: usize,
-        pad_w: usize,
-    ) {
-        let col_size = c * 9;
-
-        // Parallel over batches and output positions
-        output
+        col_data
             .par_chunks_mut(col_size)
             .enumerate()
             .for_each(|(window_idx, out_chunk)| {
-                let batch = window_idx / (h_out * w_out);
-                let pos = window_idx % (h_out * w_out);
-                let out_h = pos / w_out;
-                let out_w = pos % w_out;
-
-                let batch_offset = batch * c * h_in * w_in;
+                let batch = window_idx / spatial;
+                let pos = window_idx % spatial;
+                let (out_h, out_w) = (pos / w_out, pos % w_out);
 
                 for ch in 0..c {
-                    let ch_offset = ch * 9;
+                    let in_plane = batch * c * h_in * w_in + ch * h_in * w_in;
+                    for k_row in 0..k_h {
+                        let ih = out_h * stride_h + k_row * dil_h;
+                        // Padding stays zero — `out_chunk` starts zeroed.
+                        if ih < pad_h || ih >= h_in + pad_h {
+                            continue;
+                        }
+                        let ih = ih - pad_h;
 
-                    // Unrolled 3x3 kernel with SIMD-friendly access pattern
-                    for k_row in 0..3 {
-                        let in_h = out_h + k_row;
-                        let in_h_valid = in_h >= pad_h && in_h < h_in + pad_h;
-                        let in_h_idx = if in_h_valid { in_h - pad_h } else { 0 };
+                        for k_col in 0..k_w {
+                            let iw = out_w * stride_w + k_col * dil_w;
+                            if iw < pad_w || iw >= w_in + pad_w {
+                                continue;
+                            }
+                            let iw = iw - pad_w;
 
-                        for k_col in 0..3 {
-                            let in_w = out_w + k_col;
-                            let idx = ch_offset + k_row * 3 + k_col;
+                            out_chunk[ch * k_h * k_w + k_row * k_w + k_col] =
+                                data[in_plane + ih * w_in + iw];
+                        }
+                    }
+                }
+            });
 
-                            if in_h_valid && in_w >= pad_w && in_w < w_in + pad_w {
-                                let in_w_idx = in_w - pad_w;
-                                let in_idx =
-                                    batch_offset + ch * h_in * w_in + in_h_idx * w_in + in_w_idx;
-                                out_chunk[idx] = input[in_idx];
-                            } else {
-                                out_chunk[idx] = 0.0;
+        let mut output = Tensor::new(col_data, &[num_windows, col_size]);
+
+        // col2im. Without this edge, conv2d had no path back to its input, and
+        // (combined with transpose_4d) no path back to its weights either.
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gcol) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let gin = slot.get_or_insert_with(|| vec![0.0; n * c * h_in * w_in]);
+
+                    // Scatter-add: overlapping windows contribute to the same
+                    // input pixel, so this accumulates rather than assigns.
+                    for window_idx in 0..num_windows {
+                        let batch = window_idx / spatial;
+                        let pos = window_idx % spatial;
+                        let (out_h, out_w) = (pos / w_out, pos % w_out);
+                        let col_base = window_idx * col_size;
+
+                        for ch in 0..c {
+                            let in_plane = batch * c * h_in * w_in + ch * h_in * w_in;
+                            for k_row in 0..k_h {
+                                let ih = out_h * stride_h + k_row * dil_h;
+                                if ih < pad_h || ih >= h_in + pad_h {
+                                    continue;
+                                }
+                                let ih = ih - pad_h;
+
+                                for k_col in 0..k_w {
+                                    let iw = out_w * stride_w + k_col * dil_w;
+                                    if iw < pad_w || iw >= w_in + pad_w {
+                                        continue;
+                                    }
+                                    let iw = iw - pad_w;
+
+                                    gin[in_plane + ih * w_in + iw] +=
+                                        gcol[col_base + ch * k_h * k_w + k_row * k_w + k_col];
+                                }
                             }
                         }
                     }
                 }
             });
-    }
-
-    /// Ultra-fast 1x1 convolution (just reshape)
-    #[inline]
-    fn im2col_1x1(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        _n: usize,
-        _c: usize,
-        h_in: usize,
-        w_in: usize,
-        h_out: usize,
-        w_out: usize,
-    ) {
-        // 1x1 conv is just a reshape - use SIMD memcpy
-        assert_eq!(h_in, h_out);
-        assert_eq!(w_in, w_out);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(input.as_ptr(), output.as_mut_ptr(), input.len());
         }
-    }
 
-    /// General case with SIMD optimizations
-    #[inline]
-    fn im2col_general_simd(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        n: usize,
-        c: usize,
-        h_in: usize,
-        w_in: usize,
-        h_out: usize,
-        w_out: usize,
-        k_h: usize,
-        k_w: usize,
-        stride_h: usize,
-        stride_w: usize,
-        pad_h: usize,
-        pad_w: usize,
-        dil_h: usize,
-        dil_w: usize,
-    ) {
-        let col_size = c * k_h * k_w;
-
-        // Vectorized when copying contiguous regions
-        for batch in 0..n {
-            for out_h in 0..h_out {
-                for out_w in 0..w_out {
-                    let window_idx = batch * h_out * w_out + out_h * w_out + out_w;
-                    let col_base = window_idx * col_size;
-
-                    for ch in 0..c {
-                        for k_row in 0..k_h {
-                            let in_h = out_h * stride_h + k_row * dil_h;
-
-                            if in_h >= pad_h && in_h < h_in + pad_h {
-                                let in_h_idx = in_h - pad_h;
-
-                                // Try to copy entire rows when possible (SIMD opportunity)
-                                let mut consecutive_count = 0;
-                                let mut start_k_col = 0;
-
-                                for k_col in 0..k_w {
-                                    let in_w = out_w * stride_w + k_col * dil_w;
-
-                                    if in_w >= pad_w
-                                        && in_w < w_in + pad_w
-                                        && consecutive_count == k_col - start_k_col
-                                    {
-                                        consecutive_count += 1;
-                                    } else {
-                                        // Copy accumulated consecutive elements
-                                        if consecutive_count > 0 {
-                                            self.copy_consecutive_elements(
-                                                input,
-                                                output,
-                                                batch,
-                                                ch,
-                                                c,
-                                                h_in,
-                                                w_in,
-                                                in_h_idx,
-                                                out_w * stride_w + start_k_col * dil_w - pad_w,
-                                                col_base
-                                                    + ch * k_h * k_w
-                                                    + k_row * k_w
-                                                    + start_k_col,
-                                                consecutive_count,
-                                            );
-                                        }
-
-                                        // Handle non-consecutive element
-                                        let col_idx =
-                                            col_base + ch * k_h * k_w + k_row * k_w + k_col;
-
-                                        if in_w >= pad_w && in_w < w_in + pad_w {
-                                            let in_w_idx = in_w - pad_w;
-                                            let in_idx = batch * c * h_in * w_in
-                                                + ch * h_in * w_in
-                                                + in_h_idx * w_in
-                                                + in_w_idx;
-                                            output[col_idx] = input[in_idx];
-                                        }
-
-                                        start_k_col = k_col + 1;
-                                        consecutive_count = 0;
-                                    }
-                                }
-
-                                // Handle remaining consecutive elements
-                                if consecutive_count > 0 {
-                                    self.copy_consecutive_elements(
-                                        input,
-                                        output,
-                                        batch,
-                                        ch,
-                                        c,
-                                        h_in,
-                                        w_in,
-                                        in_h_idx,
-                                        out_w * stride_w + start_k_col * dil_w - pad_w,
-                                        col_base + ch * k_h * k_w + k_row * k_w + start_k_col,
-                                        consecutive_count,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// SIMD-optimized copy of consecutive elements
-    #[inline]
-    fn copy_consecutive_elements(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        batch: usize,
-        ch: usize,
-        c_total: usize,
-        h_in: usize,
-        w_in: usize,
-        in_h: usize,
-        in_w_start: usize,
-        out_start: usize,
-        count: usize,
-    ) {
-        if count >= 8 && in_w_start + count <= w_in {
-            // Use SIMD for larger copies
-            let in_base =
-                batch * c_total * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w_start;
-
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if is_x86_feature_detected!("avx") && count >= 8 {
-                        use std::arch::x86_64::*;
-                        let chunks = count / 8;
-                        for i in 0..chunks {
-                            let v = _mm256_loadu_ps(input.as_ptr().add(in_base + i * 8));
-                            _mm256_storeu_ps(output.as_mut_ptr().add(out_start + i * 8), v);
-                        }
-
-                        // Handle remainder
-                        for i in (chunks * 8)..count {
-                            output[out_start + i] = input[in_base + i];
-                        }
-                        return;
-                    }
-                }
-
-                // Fallback: vectorizable memcpy
-                std::ptr::copy_nonoverlapping(
-                    input.as_ptr().add(in_base),
-                    output.as_mut_ptr().add(out_start),
-                    count,
-                );
-            }
-        } else {
-            // Scalar copy for small counts
-            for i in 0..count {
-                let in_w = in_w_start + i;
-                if in_w < w_in {
-                    let in_idx =
-                        batch * c_total * h_in * w_in + ch * h_in * w_in + in_h * w_in + in_w;
-                    output[out_start + i] = input[in_idx];
-                }
-            }
-        }
+        output
     }
 
     /// Helper: Add bias to 4D tensor (broadcast along channel dimension)
@@ -2160,11 +1974,9 @@ impl Tensor {
 
                         // Sum gradients across N, H, W dimensions for each channel
                         for batch in 0..n {
-                            for channel in 0..c {
+                            for (channel, g) in gb.iter_mut().enumerate() {
                                 let base_idx = batch * c * h * w + channel * h * w;
-                                for spatial in 0..(h * w) {
-                                    gb[channel] += gout[base_idx + spatial];
-                                }
+                                *g += gout[base_idx..base_idx + h * w].iter().sum::<f32>();
                             }
                         }
                     }
@@ -2178,6 +1990,16 @@ impl Tensor {
     /// Helper: 4D tensor transpose for dimension reordering
     fn transpose_4d(&self, axes: &[usize; 4]) -> Tensor {
         assert_eq!(self.shape.len(), 4);
+        {
+            let mut seen = [false; 4];
+            for &a in axes {
+                assert!(
+                    a < 4 && !seen[a],
+                    "transpose_4d: {axes:?} is not a permutation"
+                );
+                seen[a] = true;
+            }
+        }
 
         let old_shape = &self.shape;
         let new_shape = [
@@ -2216,8 +2038,48 @@ impl Tensor {
                 }
             }
         }
+        drop(data);
 
-        Tensor::new(result_data, &new_shape)
+        let mut output = Tensor::new(result_data, &new_shape);
+
+        // conv2d ends with an NHWC->NCHW transpose. Rebuilding the tensor here
+        // without a backward edge cut the graph immediately after the matmul,
+        // so no gradient ever reached the convolution weights.
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+            let axes = *axes;
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let gin = slot.get_or_insert_with(|| vec![0.0; d0 * d1 * d2 * d3]);
+
+                    // Same index map as the forward pass, run in reverse.
+                    for i0 in 0..d0 {
+                        for i1 in 0..d1 {
+                            for i2 in 0..d2 {
+                                for i3 in 0..d3 {
+                                    let old_idx = i0 * d1 * d2 * d3 + i1 * d2 * d3 + i2 * d3 + i3;
+
+                                    let idx = [i0, i1, i2, i3];
+                                    let new_idx =
+                                        idx[axes[0]] * new_shape[1] * new_shape[2] * new_shape[3]
+                                            + idx[axes[1]] * new_shape[2] * new_shape[3]
+                                            + idx[axes[2]] * new_shape[3]
+                                            + idx[axes[3]];
+
+                                    gin[old_idx] += gout[new_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        output
     }
 
     /// Quantize tensor based on configuration
@@ -2241,16 +2103,14 @@ impl Tensor {
                 QuantizedTensor::BFloat16(self.quantize_to_bfloat16())
             }
             crate::quantization::QuantizationType::NF4 => {
-                QuantizedTensor::NF4(self.quantize_to_nf4(config))
+                QuantizedTensor::NF4(self.quantize_to_nf4())
             }
         }
     }
 
-    /// Quantize to int8
-    fn quantize_to_int8(&self, config: &QuantizationConfig) -> Int8Tensor {
+    /// Observed finite range of this tensor, widened so it is never degenerate.
+    fn finite_range(&self) -> (f32, f32) {
         let data = self.data();
-        let (qmin, qmax) = config.compute_range().unwrap();
-
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
 
@@ -2261,55 +2121,134 @@ impl Tensor {
             }
         }
 
-        if min_val == max_val {
-            min_val -= 0.1;
-            max_val += 0.1;
+        // Empty tensors, or tensors that are entirely NaN/inf, leave the
+        // sentinels untouched; a scale derived from those would be inf or NaN.
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return (-0.1, 0.1);
         }
-
-        let qrange = (qmax - qmin) as f32;
-        let scale = (max_val - min_val) / qrange;
-        let zero_point = qmin;
-
-        let quantized_data: Vec<i8> = data
-            .iter()
-            .map(|&x| {
-                let q = ((x - min_val) / scale).round() as i32 + qmin;
-                q.clamp(qmin, qmax) as i8
-            })
-            .collect();
-
-        Int8Tensor {
-            data: Arc::new(RwLock::new(quantized_data)),
-            shape: self.shape.clone(),
-            scale,
-            zero_point,
-            min_val, // Store it!
+        if min_val == max_val {
+            (min_val - 0.1, max_val + 0.1)
+        } else {
+            (min_val, max_val)
         }
     }
 
-    /// Quantize to int4 (packed representation)
-    fn quantize_to_int4(&self, _config: &QuantizationConfig) -> Int4Tensor {
-        unimplemented!(
-            "Int4 quantization not yet implemented: packing two 4-bit values per byte needed"
+    /// Affine quantization to a signed integer grid `[qmin, qmax]`.
+    ///
+    /// Returns the codes together with the `(scale, zero_point)` such that
+    /// `x ≈ (q - zero_point) * scale`.
+    fn quantize_affine(&self, qmin: i32, qmax: i32) -> (Vec<i32>, f32, i32) {
+        let (min_val, max_val) = self.finite_range();
+        let scale = (max_val - min_val) / (qmax - qmin) as f32;
+
+        // `zero_point` is the code that represents 0.0. Anchoring it at the
+        // bottom of the grid (`qmin - min/scale`) is what makes `min_val` land
+        // on `qmin` and `max_val` on `qmax`. Deriving it as `-min/scale`
+        // instead — correct only for an unsigned grid starting at 0 — pushed
+        // every value 128 codes too high and clipped half the dynamic range.
+        let zero_point = (qmin as f32 - min_val / scale).round() as i32;
+
+        let data = self.data();
+        let codes = data
+            .iter()
+            .map(|&x| {
+                let q = (x / scale).round() as i32 + zero_point;
+                q.clamp(qmin, qmax)
+            })
+            .collect();
+
+        (codes, scale, zero_point)
+    }
+
+    /// Quantize to int8
+    fn quantize_to_int8(&self, config: &QuantizationConfig) -> Int8Tensor {
+        let (qmin, qmax) = config
+            .compute_range()
+            .expect("int8 config must define a range");
+        let (codes, scale, zero_point) = self.quantize_affine(qmin, qmax);
+
+        Int8Tensor::new(
+            codes.into_iter().map(|q| q as i8).collect(),
+            self.shape.clone(),
+            scale,
+            zero_point,
+        )
+    }
+
+    /// Quantize to int4 (packed two values per byte)
+    fn quantize_to_int4(&self, config: &QuantizationConfig) -> Int4Tensor {
+        let (qmin, qmax) = config
+            .compute_range()
+            .expect("int4 config must define a range");
+        let (codes, scale, zero_point) = self.quantize_affine(qmin, qmax);
+
+        // Offset by 8 so the signed range [-8, 7] maps onto the nibble's [0, 15].
+        let nibbles: Vec<u8> = codes.into_iter().map(|q| (q + 8) as u8).collect();
+
+        Int4Tensor::new(
+            pack_nibbles(&nibbles),
+            self.shape.clone(),
+            scale,
+            zero_point,
         )
     }
 
     /// Convert to float16
     fn quantize_to_float16(&self) -> Float16Tensor {
-        let data = self.data();
-        let f16_data: Vec<u16> = data.iter().map(|&x| Self::f32_to_f16(x)).collect();
-
-        Float16Tensor::new(f16_data, self.shape.clone())
+        Float16Tensor::from_f32_tensor(self)
     }
 
     /// Convert to bfloat16
     fn quantize_to_bfloat16(&self) -> BFloat16Tensor {
-        unimplemented!("BFloat16 quantization not yet implemented: f32-to-bf16 conversion needed")
+        BFloat16Tensor::from_f32_tensor(self)
     }
 
-    /// Quantize to NF4
-    fn quantize_to_nf4(&self, _config: &QuantizationConfig) -> NF4Tensor {
-        unimplemented!("NF4 quantization not yet implemented: NF4 lookup table and packing needed")
+    /// Quantize to NF4: normalize by the absolute maximum, then snap each value
+    /// to the nearest of the 16 NF4 levels.
+    fn quantize_to_nf4(&self) -> NF4Tensor {
+        let data = self.data();
+        let absmax = data
+            .iter()
+            .filter(|x| x.is_finite())
+            .fold(0.0f32, |acc, x| acc.max(x.abs()));
+        // An all-zero (or non-finite) tensor has no scale; 1.0 keeps the
+        // normalization a no-op instead of producing NaN codes.
+        let absmax = if absmax > 0.0 { absmax } else { 1.0 };
+
+        let codes: Vec<u8> = data
+            .iter()
+            .map(|&x| {
+                let normalized = if x.is_finite() { x / absmax } else { 0.0 };
+                NF4_LEVELS
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (*a - normalized).abs().total_cmp(&(*b - normalized).abs())
+                    })
+                    .map(|(i, _)| i as u8)
+                    .expect("NF4_LEVELS is non-empty")
+            })
+            .collect();
+        drop(data);
+
+        NF4Tensor::new(pack_nibbles(&codes), self.shape.clone(), absmax)
+    }
+
+    /// Convert f32 to bfloat16 bits (round-to-nearest-even on the low 16 bits).
+    pub fn f32_to_bf16(value: f32) -> u16 {
+        if value.is_nan() {
+            // Preserve NaN-ness; truncation alone can turn a NaN into an infinity.
+            return 0x7FC0;
+        }
+        let bits = value.to_bits();
+        let lsb = (bits >> 16) & 1;
+        let rounded = bits + 0x7FFF + lsb;
+        (rounded >> 16) as u16
+    }
+
+    /// Convert bfloat16 bits back to f32 (exact: bf16 is a truncated f32).
+    pub fn bf16_to_f32(value: u16) -> f32 {
+        f32::from_bits((value as u32) << 16)
     }
 
     /// Convert f32 to f16 (IEEE 754 half precision)
@@ -2359,7 +2298,7 @@ impl Tensor {
         // Convert mantissa from 23 bits to 10 bits (with rounding)
         let f16_mantissa = (mantissa + 0x1000) >> 13; // Round to nearest
 
-        ((sign << 15) | ((f16_exponent as u32) << 10) | (f16_mantissa as u32)) as u16
+        ((sign << 15) | ((f16_exponent as u32) << 10) | f16_mantissa) as u16
     }
 
     /// Convert f16 to f32 (IEEE 754 half precision)
@@ -2383,7 +2322,7 @@ impl Tensor {
         if exponent == 0 {
             if mantissa == 0 {
                 // Zero (positive or negative)
-                return f32::from_bits((sign << 31) as u32);
+                return f32::from_bits(sign << 31);
             }
 
             // Denormalized number - convert to normalized f32

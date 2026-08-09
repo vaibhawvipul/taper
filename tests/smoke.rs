@@ -18,7 +18,7 @@ macro_rules! g {
 
 #[test]
 fn mul_grads() {
-    let _tape = Tape::reset();
+    Tape::reset();
     let x = Tensor::scalar(2.0).requires_grad();
     let y = Tensor::scalar(3.0).requires_grad();
     let z = &x * &y;
@@ -31,7 +31,7 @@ fn mul_grads() {
 
 #[test]
 fn compound_affine() {
-    let _tape = Tape::reset();
+    Tape::reset();
     let a = Tensor::scalar(2.0).requires_grad();
     let b = Tensor::scalar(3.0).requires_grad();
     let c = &a * &b + &a; // c = a*b + a
@@ -44,7 +44,7 @@ fn compound_affine() {
 
 #[test]
 fn matmul_shapes_and_grads() {
-    let _tape = Tape::reset();
+    Tape::reset();
 
     // [2x3] @ [3x2] -> [2x2]
     let a = Tensor::new(vec![1., 2., 3., 4., 5., 6.], &[2, 3]).requires_grad();
@@ -195,31 +195,63 @@ fn verify_simd_is_working() {
     println!("SIMD time: {:.2} ms", simd_time.as_millis());
     println!("Speedup: {:.2}x", speedup);
 
-    // Verdict
     println!("\n=== Verdict ===");
-    if speedup > 2.0 {
-        println!("SIMD is working fine! {:.1}x speedup", speedup);
-    } else if speedup > 1.5 {
-        println!("SIMD is working! {:.1}x speedup", speedup);
-    } else if speedup > 1.2 {
-        println!(
-            "Modest SIMD benefit ({:.1}x). May be memory-bound.",
-            speedup
-        );
-    } else {
-        println!(
-            "SIMD doesn't appear to be active (only {:.1}x speedup)",
-            speedup
-        );
-        println!("  Try: RUSTFLAGS=\"-C target-cpu=native\" cargo test --release");
-    }
+    println!("Observed speedup: {:.2}x", speedup);
+    println!("  (informational — run with --release and RUSTFLAGS=\"-C target-cpu=native\")");
 
-    // Assert reasonable performance (adjust threshold as needed)
-    assert!(
-        speedup > 1.2,
-        "Expected SIMD speedup > 1.2x, got {:.2}x",
-        speedup
-    );
+    // Deliberately no timing assertion. This used to require `speedup > 1.2`,
+    // which fails on an unoptimized build (the scalar baseline is not compiled
+    // away, and the tensor path additionally allocates), and on any loaded
+    // machine. What must actually hold is that the vectorized kernels agree
+    // with scalar arithmetic — assert that instead, since it is deterministic.
+    let simd_sum = &tensor_a + &tensor_b;
+    let simd_prod = &tensor_a * &tensor_b;
+    let sum_data = simd_sum.data();
+    let prod_data = simd_prod.data();
+
+    for i in 0..test_size {
+        assert!(
+            (sum_data[i] - (vec_a[i] + vec_b[i])).abs() < 1e-3,
+            "SIMD add disagrees with scalar at {i}: {} vs {}",
+            sum_data[i],
+            vec_a[i] + vec_b[i]
+        );
+        assert!(
+            (prod_data[i] - vec_a[i] * vec_b[i]).abs() <= (vec_a[i] * vec_b[i]).abs() * 1e-5,
+            "SIMD mul disagrees with scalar at {i}: {} vs {}",
+            prod_data[i],
+            vec_a[i] * vec_b[i]
+        );
+    }
+}
+
+/// Lengths that are not a multiple of the SIMD width must still be fully
+/// computed — the vectorized kernels handle the head in chunks and the tail
+/// element-wise, and a target with neither AVX nor NEON must fall back to
+/// scalar rather than leaving the output untouched.
+#[test]
+fn simd_kernels_handle_every_length() {
+    for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33] {
+        let a: Vec<f32> = (0..len).map(|i| i as f32 + 0.5).collect();
+        let b: Vec<f32> = (0..len).map(|i| i as f32 * 2.0 - 1.0).collect();
+
+        let ta = Tensor::new(a.clone(), &[len]);
+        let tb = Tensor::new(b.clone(), &[len]);
+
+        let sum = &ta + &tb;
+        let prod = &ta * &tb;
+
+        for i in 0..len {
+            assert!(
+                (sum.data()[i] - (a[i] + b[i])).abs() < 1e-4,
+                "add wrong at len={len}, i={i}"
+            );
+            assert!(
+                (prod.data()[i] - a[i] * b[i]).abs() < 1e-4,
+                "mul wrong at len={len}, i={i}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -291,7 +323,7 @@ fn test_reshape_operations() {
 
 #[test]
 fn test_reshape_gradients() {
-    let _tape = Tape::reset();
+    Tape::reset();
 
     let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).requires_grad();
     let reshaped = x.reshape(&[4]);
@@ -317,7 +349,7 @@ fn test_sum_operations() {
     // Test sum along dimension 0
     let sum_dim0 = x.sum(Some(0), false);
     assert_eq!(sum_dim0.shape(), &[3]);
-    let expected = vec![5.0, 7.0, 9.0]; // [1+4, 2+5, 3+6]
+    let expected = [5.0, 7.0, 9.0]; // [1+4, 2+5, 3+6]
     for (a, b) in sum_dim0.data().iter().zip(expected.iter()) {
         assert!((a - b).abs() < 1e-6);
     }
@@ -325,7 +357,7 @@ fn test_sum_operations() {
     // Test sum along dimension 1
     let sum_dim1 = x.sum(Some(1), false);
     assert_eq!(sum_dim1.shape(), &[2]);
-    let expected = vec![6.0, 15.0]; // [1+2+3, 4+5+6]
+    let expected = [6.0, 15.0]; // [1+2+3, 4+5+6]
     for (a, b) in sum_dim1.data().iter().zip(expected.iter()) {
         assert!((a - b).abs() < 1e-6);
     }
@@ -337,7 +369,7 @@ fn test_sum_operations() {
 
 #[test]
 fn test_sum_gradients() {
-    let _tape = Tape::reset();
+    Tape::reset();
 
     // Test gradient flow through sum
     let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).requires_grad();
@@ -383,7 +415,7 @@ fn test_exp_log_operations() {
     // Test exp
     let exp_x = x.exp();
     assert!((exp_x.data()[0] - 1.0).abs() < 1e-6); // e^0 = 1
-    assert!((exp_x.data()[1] - 2.71828).abs() < 1e-2); // e^1 ≈ 2.718
+    assert!((exp_x.data()[1] - std::f32::consts::E).abs() < 1e-2);
     assert!((exp_x.data()[2] - 7.38906).abs() < 1e-2); // e^2 ≈ 7.389
 
     // Test log
@@ -407,7 +439,7 @@ fn test_exp_log_operations() {
 
 #[test]
 fn test_exp_log_gradients() {
-    let _tape = Tape::reset();
+    Tape::reset();
 
     // Test exp gradient
     let x = Tensor::new(vec![1.0, 2.0], &[2]).requires_grad();
@@ -422,7 +454,7 @@ fn test_exp_log_gradients() {
     }
 
     // Test log gradient
-    let _tape = Tape::reset();
+    Tape::reset();
     let x = Tensor::new(vec![1.0, 2.0, 3.0], &[3]).requires_grad();
     let log_x = x.log();
     let sum = log_x.sum(None, false);
@@ -447,7 +479,7 @@ fn test_softmax_cross_entropy() {
     }
 
     // Test cross-entropy loss
-    let _tape = Tape::reset();
+    Tape::reset();
     let logits = Tensor::new(vec![2.0, 1.0, 0.0, 0.0, 1.0, 2.0], &[2, 3]).requires_grad();
     let targets = Tensor::new(vec![0.0, 2.0], &[2]); // First sample -> class 0, second -> class 2
 
@@ -461,7 +493,7 @@ fn test_softmax_cross_entropy() {
 #[test]
 fn test_mnist_simulation() {
     // Simulate a mini MNIST-like scenario
-    let _tape = Tape::reset();
+    Tape::reset();
 
     // Mock data: 4 samples, 784 features (28x28 flattened)
     let batch_size = 4;
@@ -492,7 +524,7 @@ fn test_mnist_simulation() {
 
     // Check accuracy computation
     let acc = accuracy(&logits, &targets);
-    assert!(acc >= 0.0 && acc <= 1.0);
+    assert!((0.0..=1.0).contains(&acc));
 
     println!(
         "Mini MNIST test - Loss: {:.4}, Accuracy: {:.2}%",
@@ -511,7 +543,7 @@ fn test_numerical_stability() {
     for &p in probs.data().iter() {
         assert!(!p.is_nan());
         assert!(!p.is_infinite());
-        assert!(p >= 0.0 && p <= 1.0);
+        assert!((0.0..=1.0).contains(&p));
     }
 
     // Test log_softmax stability

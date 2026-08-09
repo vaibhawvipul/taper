@@ -1,12 +1,12 @@
 use crate::data::mnist::DataLoader;
-use crate::loss::{accuracy, cross_entropy_loss};
+use crate::loss::{correct_count, cross_entropy_loss};
 use crate::optim::{Adam, LRScheduler};
 use crate::{Tape, nn::Module};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Instant;
 
 /// Training metrics tracking
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Metrics {
     pub train_loss: Vec<f32>,
     pub train_acc: Vec<f32>,
@@ -17,13 +17,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        Metrics {
-            train_loss: Vec::new(),
-            train_acc: Vec::new(),
-            val_loss: Vec::new(),
-            val_acc: Vec::new(),
-            epoch_times: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn print_last(&self) {
@@ -58,7 +52,7 @@ impl Metrics {
             println!("Final Train Accuracy: {:.2}%", final_train_acc * 100.0);
             println!("Final Val Accuracy: {:.2}%", final_val_acc * 100.0);
 
-            if self.epoch_times.len() > 0 {
+            if !self.epoch_times.is_empty() {
                 let total_time: f32 = self.epoch_times.iter().sum();
                 let avg_time = total_time / self.epoch_times.len() as f32;
                 println!("Total Training Time: {:.2}s", total_time);
@@ -77,6 +71,9 @@ pub struct Trainer {
     pub scheduler: Option<Box<dyn LRScheduler>>,
     pub metrics: Metrics,
     pub device: String, // For future GPU support
+    /// Stop [`Trainer::fit`] once validation accuracy reaches this value.
+    /// `None` runs every requested epoch.
+    pub early_stop_val_acc: Option<f32>,
 }
 
 impl Trainer {
@@ -91,7 +88,14 @@ impl Trainer {
             scheduler,
             metrics: Metrics::new(),
             device: "cpu".to_string(),
+            early_stop_val_acc: Some(0.99),
         }
+    }
+
+    /// Set (or clear, with `None`) the validation-accuracy early-stop threshold.
+    pub fn with_early_stop(mut self, val_acc: Option<f32>) -> Self {
+        self.early_stop_val_acc = val_acc;
+        self
     }
 
     /// Train for one epoch
@@ -111,10 +115,10 @@ impl Trainer {
             let logits = self.model.forward(&images);
             let loss = cross_entropy_loss(&logits, &labels);
 
-            // Calculate accuracy
-            let acc = accuracy(&logits, &labels);
+            // Calculate accuracy. Counting directly avoids the ratio round trip
+            // `(acc * batch_size) as usize`, whose truncation undercounted.
             let batch_size = images.shape()[0];
-            total_correct += (acc * batch_size as f32) as usize;
+            total_correct += correct_count(&logits, &labels);
             total_samples += batch_size;
 
             // Backward pass
@@ -152,21 +156,29 @@ impl Trainer {
         dataloader.reset();
         let num_batches = dataloader.num_batches();
 
-        // No gradient computation needed for evaluation
+        // No gradient computation needed for evaluation. Without this guard the
+        // model's parameters still require grad, so every batch appended
+        // backward closures — each holding its inputs alive — to the tape, and
+        // nothing cleared them until the next training epoch.
+        let _guard = crate::tape::no_grad();
+
         for (images, labels) in dataloader {
             let logits = self.model.forward(&images);
             let loss = cross_entropy_loss(&logits, &labels);
 
-            let acc = accuracy(&logits, &labels);
             let batch_size = images.shape()[0];
-            total_correct += (acc * batch_size as f32) as usize;
+            total_correct += correct_count(&logits, &labels);
             total_samples += batch_size;
 
             total_loss += loss.data()[0];
         }
 
         let avg_loss = total_loss / num_batches as f32;
-        let avg_acc = total_correct as f32 / total_samples as f32;
+        let avg_acc = if total_samples == 0 {
+            0.0
+        } else {
+            total_correct as f32 / total_samples as f32
+        };
 
         (avg_loss, avg_acc)
     }
@@ -203,10 +215,13 @@ impl Trainer {
             }
 
             // Training phase
+            self.model.set_training(true);
             let (train_loss, train_acc) = self.train_epoch(train_loader);
 
             // Validation phase
+            self.model.set_training(false);
             let (val_loss, val_acc) = self.evaluate(val_loader);
+            self.model.set_training(true);
 
             // Update learning rate
             if let Some(scheduler) = &mut self.scheduler {
@@ -246,8 +261,13 @@ impl Trainer {
             }
 
             // Early stopping check (optional)
-            if val_acc > 0.99 {
-                println!("\nReached 99% validation accuracy! Stopping early.");
+            if let Some(threshold) = self.early_stop_val_acc
+                && val_acc > threshold
+            {
+                println!(
+                    "\nReached {:.1}% validation accuracy! Stopping early.",
+                    threshold * 100.0
+                );
                 break;
             }
         }
@@ -260,13 +280,18 @@ impl Trainer {
         self.metrics.plot_summary();
     }
 
-    /// Save model checkpoint (basic version - can be enhanced)
+    /// Save model checkpoint.
+    ///
+    /// Format: parameter count, then per parameter a shape line
+    /// (`rank dim0 dim1 …`) followed by one value per line.
     pub fn save_checkpoint(&self, path: &str) -> std::io::Result<()> {
         use std::fs::File;
-        use std::io::Write;
+        use std::io::{BufWriter, Write};
 
         let params = self.model.parameters();
-        let mut file = File::create(path)?;
+        // Unbuffered writes cost one syscall per float; MNIST MLP checkpoints
+        // are ~100k of them.
+        let mut file = BufWriter::new(File::create(path)?);
 
         // Simple format: write number of parameters, then each parameter's data
         writeln!(file, "{}", params.len())?;
@@ -286,6 +311,75 @@ impl Trainer {
             for value in data.iter() {
                 writeln!(file, "{}", value)?;
             }
+        }
+
+        file.flush()
+    }
+
+    /// Load parameters previously written by [`Trainer::save_checkpoint`] into
+    /// this trainer's model, in `parameters()` order.
+    ///
+    /// The saver shipped without a counterpart, so checkpoints could be written
+    /// but never restored.
+    pub fn load_checkpoint(&mut self, path: &str) -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader, Error, ErrorKind};
+
+        let file = BufReader::new(File::open(path)?);
+        let mut lines = file.lines();
+        let malformed = |msg: String| -> Error {
+            Error::new(ErrorKind::InvalidData, format!("checkpoint: {msg}"))
+        };
+
+        let mut next = |what: &str| -> std::io::Result<String> {
+            lines
+                .next()
+                .transpose()?
+                .ok_or_else(|| malformed(format!("unexpected end of file reading {what}")))
+        };
+
+        let count: usize = next("parameter count")?
+            .trim()
+            .parse()
+            .map_err(|e| malformed(format!("bad parameter count: {e}")))?;
+
+        let params = self.model.parameters();
+        if count != params.len() {
+            return Err(malformed(format!(
+                "holds {count} parameters but the model has {}",
+                params.len()
+            )));
+        }
+
+        for (i, param) in params.iter().enumerate() {
+            let shape_line = next(&format!("shape of parameter {i}"))?;
+            let dims: Vec<usize> = shape_line
+                .split_whitespace()
+                .skip(1) // leading rank
+                .map(|d| d.parse::<usize>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| malformed(format!("bad shape for parameter {i}: {e}")))?;
+
+            if dims != param.shape() {
+                return Err(malformed(format!(
+                    "parameter {i} has shape {dims:?} but the model expects {:?}",
+                    param.shape()
+                )));
+            }
+
+            let numel: usize = dims.iter().product();
+            let mut values = Vec::with_capacity(numel);
+            for j in 0..numel {
+                let value = next(&format!("value {j} of parameter {i}"))?;
+                values.push(
+                    value
+                        .trim()
+                        .parse::<f32>()
+                        .map_err(|e| malformed(format!("bad value in parameter {i}: {e}")))?,
+                );
+            }
+
+            param.data_mut().copy_from_slice(&values);
         }
 
         Ok(())
@@ -312,11 +406,12 @@ pub fn quick_train_mnist(
 }
 
 /// Utility function to test model on a few samples
-pub fn test_samples(model: &Box<dyn Module>, dataloader: &mut DataLoader, num_samples: usize) {
+pub fn test_samples(model: &dyn Module, dataloader: &mut DataLoader, num_samples: usize) {
     println!("\nTesting on {} samples:", num_samples);
     println!("{}", "-".repeat(40));
 
     dataloader.reset();
+    let _guard = crate::tape::no_grad();
 
     if let Some((images, labels)) = dataloader.next() {
         let n = num_samples.min(images.shape()[0]);
@@ -413,6 +508,6 @@ mod tests {
         let (loss, acc) = trainer.train_epoch(&mut train_loader);
 
         assert!(loss > 0.0);
-        assert!(acc >= 0.0 && acc <= 1.0);
+        assert!((0.0..=1.0).contains(&acc));
     }
 }

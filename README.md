@@ -1,15 +1,13 @@
 # taper
 A lightweight neural network library in Rust with automatic differentiation.
 
-## Goal - >99% with CNN in 50 epochs
-
 ## Features
 - Dynamic computational graph with tape-based autograd
-- SIMD-optimized tensor operations (AVX/SSE/NEON)
-- Neural network layers: Linear, ReLU, Sigmoid, Conv2D, MaxPool2D, AvgPool2D, Flatten
-- Optimizers: SGD, Adam, AdamW with learning rate scheduling
+- SIMD-optimized tensor operations (AVX/SSE/NEON, with a scalar fallback)
+- Neural network layers: Linear, ReLU, Sigmoid, Conv2D, MaxPool2D, AvgPool2D, Dropout, Flatten
+- Optimizers: SGD (with momentum), Adam, AdamW, and learning rate scheduling
 - Loss functions: MSE, Cross-entropy, BCE
-- Post-Training Quantization (PTQ): Int8/Float16 model compression with <1% accuracy loss
+- Post-Training Quantization (PTQ) and Quantization-Aware Training (QAT)
 - MNIST dataset support with data loading utilities
 
 ## Performance
@@ -17,37 +15,88 @@ A lightweight neural network library in Rust with automatic differentiation.
 - Cross-platform SIMD optimizations
 - Memory-efficient gradient computation
 
-Note - Following numbers are on MacBook Pro M4 Pro (12 cores) -
-- gets ~99% accuracy on MNIST with a simple MLP in 10 epochs under 2 seconds total time (with BLAS). Pytorch equivalent takes ~1.5 seconds per epoch, i.e. ~15 seconds total time.
-- gets ~96% accuracy on MNIST with a simple CNN in 50 epochs, around 13 seconds per epoch (with BLAS). Pytorch equivalent takes ~120 seconds per epoch.
+Measured on a MacBook Pro M4 Pro (12 cores), with `--features blas-accelerate`:
+
+| Model | Result |
+| --- | --- |
+| MLP, 10 epochs | 99.1% train / 97.9% test, ~0.26 s/epoch |
+| CNN, 2 epochs | 96.9% test |
 
 ## Technical Implementation
 
-- Operation Fusion: Combines multiple ops (Conv+ReLU) into single kernels to reduce memory traffic
-- GEMM: Cache-blocked matrix multiplication with AVX vectorization for optimal CPU utilization
-- Convolution: Direct 3x3 kernels bypass im2col; 1x1 kernels use pure matrix multiplication
+- GEMM: cache-blocked matrix multiplication, or CBLAS when the `blas` feature is on
+- Convolution: im2col + GEMM, with a fused Conv+ReLU layer to cut memory traffic
 
 ## Usage
 ```sh
 # Basic training
 cargo run --example train_mnist
 
-# With BLAS acceleration (98% accuracy in 10 epochs)
+# With BLAS acceleration
 cargo run --release --features blas-accelerate --example train_mnist
 
-# Or MNIST CNN training (around 96% accuracy in 50 epochs)
+# Or MNIST CNN training
 cargo run --release --features blas-accelerate --example train_mnist_cnn
 ```
 
+### Inference
+
+Forward passes record backward closures on a thread-local tape. Wrap inference
+in a `no_grad` guard so evaluation does not accumulate a graph it will never
+use, and switch stochastic layers such as `Dropout` into evaluation mode:
+
+```rust
+use taper::{nn::Module, tape};
+
+model.set_training(false);
+let _guard = tape::no_grad();
+let predictions = model.forward(&inputs);
+```
+
+`Tape::reset()` clears the recorded graph between training steps.
+
 ## Quantization
 
-Storage-only quantization for model compression:
-- **Int8**: 4x smaller models, ~0.5% accuracy drop
-- **Float16**: 2x smaller models, <0.1% accuracy drop
-- Use cases: Deployment, memory-constrained devices, reducing storage/transfer costs
-- Note: Weights stored quantized, computation in f32 (no inference speedup)
+Storage quantization for model compression. Weights are stored quantized and
+dequantized to f32 for computation, so this reduces model size rather than
+inference latency.
+
+| Type | Size vs f32 | Notes |
+| --- | --- | --- |
+| `Int8` | 4x smaller | affine, per-tensor scale and zero point |
+| `Int4` | 8x smaller | affine, two values packed per byte |
+| `Float16` | 2x smaller | IEEE 754 half precision |
+| `BFloat16` | 2x smaller | truncated f32, round-to-nearest-even |
+| `NF4` | 8x smaller | normal-float 4-bit, absmax-scaled |
+
+On the MNIST CNN, Int8 and Float16 both land within ~0.15% of the f32 model.
 
 ```sh
 # Train and quantize a model
-cargo run --package taper --release --features blas-accelerate --example ptq_quantize
+cargo run --release --features blas-accelerate --example ptq_quantize
+
+# Quantization-aware training
+cargo run --release --features blas-accelerate --example qat_example
 ```
+
+QAT layers observe their inputs and weights during the forward pass to derive
+scales, and are gated on the global switch plus training mode:
+
+```rust
+use taper::quantization::qat_manager::global;
+
+global::enable_qat();
+global::set_training_mode(true);
+```
+
+## Development
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all
+```
+
+Note that `.cargo/config.toml` sets `-C target-cpu=native`. That is right for
+local benchmarking but produces binaries that may not run on other machines;
+override `RUSTFLAGS` when building artifacts for distribution.

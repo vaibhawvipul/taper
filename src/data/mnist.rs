@@ -313,6 +313,11 @@ impl MNISTDataset {
         self.labels.shape()[0]
     }
 
+    /// Whether the dataset holds no samples.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Normalize images with mean and std
     pub fn normalize(&mut self, mean: f32, std: f32) {
         let mut data = self.images.data_mut();
@@ -362,7 +367,7 @@ impl DataLoader {
     }
 
     pub fn num_batches(&self) -> usize {
-        (self.dataset.len() + self.batch_size - 1) / self.batch_size
+        self.dataset.len().div_ceil(self.batch_size)
     }
 }
 

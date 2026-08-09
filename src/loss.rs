@@ -173,25 +173,24 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Tensor {
     if logits.requires_grad {
         out.requires_grad = true;
         let logits_c = logits.clone();
-        let logp_c = logp.clone();
-        let targets_c = targets.clone();
         let out_c = out.clone();
 
+        // Precompute softmax - one_hot here, in the forward pass. Calling
+        // `logp.exp()` from inside the closure ran a tape-recording op *during*
+        // backward, appending nodes to the tape being replayed and leaking a
+        // tensor per backward call.
+        let mut base_grad: Vec<f32> = lp.iter().map(|v| v.exp()).collect();
+        for i in 0..b {
+            base_grad[i * c + t[i] as usize] -= 1.0;
+        }
+        drop(lp);
+        drop(t);
+
         Tape::push_unary_op(logits, &out, move || {
-            if let Some(g) = out_c.grad.read().unwrap().as_ref() {
-                let b = logits_c.shape()[0];
-                let c = logits_c.shape()[1];
-                let mut grad = logp_c.exp().data().clone(); // softmax
-                let t = targets_c.data();
-                for i in 0..b {
-                    let cls = t[i] as usize;
-                    grad[i * c + cls] -= 1.0;
-                }
+            if let Some(g) = out_c.grad.read().expect("grad RwLock poisoned").as_ref() {
                 // scale by upstream scalar / batch
                 let scale = g[0] / b as f32;
-                for gi in grad.iter_mut() {
-                    *gi *= scale;
-                }
+                let grad: Vec<f32> = base_grad.iter().map(|v| v * scale).collect();
                 ops::accumulate_grad(&logits_c, &grad);
             }
         });
@@ -228,19 +227,25 @@ pub fn cross_entropy_loss_onehot(logits: &Tensor, targets: &Tensor) -> Tensor {
     if logits.requires_grad {
         loss.requires_grad = true;
         let logits_clone = logits.clone();
-        let targets_clone = targets.clone();
         let loss_out = loss.clone();
 
+        // As in `cross_entropy_loss`, softmax - targets is computed here rather
+        // than inside the closure: recomputing `log_softmax` during backward
+        // both re-entered the tape and repeated the whole forward pass.
+        let base_grad: Vec<f32> = log_probs
+            .data()
+            .iter()
+            .zip(targets.data().iter())
+            .map(|(&lp, &t)| lp.exp() - t)
+            .collect();
+
         Tape::push_unary_op(logits, &loss, move || {
-            if let Some(gloss) = loss_out.grad.write().unwrap().as_ref() {
+            // A read lock is enough here; taking the write lock serialized
+            // backward passes against every concurrent reader for no reason.
+            if let Some(gloss) = loss_out.grad.read().expect("grad RwLock poisoned").as_ref() {
                 // Gradient: (softmax - targets) * grad_loss / batch_size
-                let probs = log_softmax(&logits_clone, -1).exp();
-                let grad_data: Vec<f32> = probs
-                    .data()
-                    .iter()
-                    .zip(targets_clone.data().iter())
-                    .map(|(&p, &t)| (p - t) * gloss[0] / batch_size as f32)
-                    .collect();
+                let scale = gloss[0] / batch_size as f32;
+                let grad_data: Vec<f32> = base_grad.iter().map(|g| g * scale).collect();
 
                 crate::ops::accumulate_grad(&logits_clone, &grad_data);
             }
@@ -273,26 +278,39 @@ pub fn one_hot(indices: &Tensor, num_classes: usize) -> Tensor {
     Tensor::new(one_hot_data, &[batch_size, num_classes])
 }
 
-/// Compute accuracy between predictions and targets
-pub fn accuracy(predictions: &Tensor, targets: &Tensor) -> f32 {
+/// Number of rows whose argmax matches the target class.
+///
+/// Prefer this over [`accuracy`] when totalling across batches: converting to a
+/// ratio and back (`(acc * batch_size) as usize`) truncates and undercounts.
+pub fn correct_count(predictions: &Tensor, targets: &Tensor) -> usize {
     assert_eq!(
         predictions.shape()[0],
         targets.shape()[0],
         "Batch sizes must match"
     );
 
+    // argmax is a tape-recording op; without this guard every metric call
+    // during evaluation appended a node that lived until the next Tape::reset.
+    let _guard = crate::tape::no_grad();
+
     let pred_classes = predictions.argmax(Some(1));
     let pred_data = pred_classes.data();
     let target_data = targets.data();
 
-    let mut correct = 0;
-    for i in 0..target_data.len() {
-        if (pred_data[i] - target_data[i]).abs() < 1e-6 {
-            correct += 1;
-        }
-    }
+    pred_data
+        .iter()
+        .zip(target_data.iter())
+        .filter(|(p, t)| (*p - *t).abs() < 1e-6)
+        .count()
+}
 
-    correct as f32 / target_data.len() as f32
+/// Compute accuracy between predictions and targets
+pub fn accuracy(predictions: &Tensor, targets: &Tensor) -> f32 {
+    let total = targets.shape()[0];
+    if total == 0 {
+        return 0.0;
+    }
+    correct_count(predictions, targets) as f32 / total as f32
 }
 
 #[cfg(test)]
@@ -319,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_cross_entropy_gradient() {
-        let _tape = Tape::reset();
+        Tape::reset();
 
         // Simple 2-class problem
         let logits = Tensor::new(vec![2.0, 1.0, -1.0, 3.0], &[2, 2]).requires_grad();

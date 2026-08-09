@@ -11,8 +11,9 @@ pub mod qat_layers;
 pub mod qat_manager;
 
 // Re-export main types for backward compatibility
-pub use config::{QuantizationConfig, QuantizationSchema, QuantizationType};
+pub use config::{QuantizationConfig, QuantizationType};
 pub use fake_quantize::FakeQuantize;
+pub use observers::{MinMaxObserver, ObserverStats};
 pub use qat_config::QATConfig;
 pub use qat_manager::QATManager;
 

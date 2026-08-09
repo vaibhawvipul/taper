@@ -50,7 +50,7 @@ fn main() {
     }
 
     // final eval
-    let _tape = Tape::reset();
+    Tape::reset();
     let x = Tensor::new(x_data, &[4, 2]);
 
     // Use regular forward pass for final evaluation

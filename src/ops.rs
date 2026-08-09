@@ -8,11 +8,7 @@ use crate::tensor::simd;
 impl Add for &Tensor {
     type Output = Tensor;
     fn add(self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.data().len(),
-            other.data().len(),
-            "Tensor dimensions must match"
-        );
+        assert_same_shape(self, other, "add");
 
         // Clone data ONCE at the start
         let (a_data, b_data) = {
@@ -52,12 +48,11 @@ impl Add for &Tensor {
 
 impl Mul for &Tensor {
     type Output = Tensor;
+    // The `+=` below accumulates gradients in the backward closure; it is not
+    // the multiplication itself, which clippy's heuristic cannot distinguish.
+    #[allow(clippy::suspicious_arithmetic_impl)]
     fn mul(self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.data().len(),
-            other.data().len(),
-            "Tensor dimensions must match"
-        );
+        assert_same_shape(self, other, "mul");
 
         let self_data = self.data();
         let other_data = other.data();
@@ -77,40 +72,25 @@ impl Mul for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().unwrap().as_ref() {
+                if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    // d/da (a*b) = b, d/db (a*b) = a. Each branch used to size the
+                    // gradient from the *other* operand's data and round-trip
+                    // through two scratch buffers; fold it into one pass.
                     if a.requires_grad {
                         let bdat = b.data();
-                        let mut slot = a.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; bdat.len()]);
+                        let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                        let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
+                        for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
+                            *g += go * bv;
                         }
-                        let ga = slot.as_mut().unwrap();
-                        let mut out = vec![0.0; ga.len()];
-
-                        // SIMD gradient multiplication and accumulation
-                        unsafe {
-                            let mut temp = vec![0.0; ga.len()];
-                            simd::mul_f32_simd(gout, &bdat, &mut temp);
-                            simd::add_f32_simd(ga, &temp, &mut out);
-                        }
-                        *ga = out;
                     }
                     if b.requires_grad {
                         let adat = a.data();
-                        let mut slot = b.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; adat.len()]);
+                        let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                        let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
+                        for ((g, &go), &av) in gb.iter_mut().zip(gout.iter()).zip(adat.iter()) {
+                            *g += go * av;
                         }
-                        let gb = slot.as_mut().unwrap();
-                        let mut out = gb.clone();
-
-                        // SIMD gradient multiplication and accumulation
-                        unsafe {
-                            let mut temp = vec![0.0; gb.len()];
-                            simd::mul_f32_simd(gout, &adat, &mut temp);
-                            simd::add_f32_simd(gb, &temp, &mut out);
-                        }
-                        *gb = out;
                     }
                 }
             });
@@ -122,32 +102,49 @@ impl Mul for &Tensor {
 // Helper function to accumulate gradients with SIMD
 #[inline]
 pub fn accumulate_grad(t: &Tensor, src: &[f32]) {
-    let mut slot = t.grad.write().unwrap();
-    if slot.is_none() {
-        *slot = Some(vec![0.0; t.data().len()]);
-    }
-    let g = slot.as_mut().unwrap();
-    // SIMD accumulate
-    let mut temp = vec![0.0; g.len()];
-
+    let mut slot = t.grad.write().expect("grad RwLock poisoned");
+    let g = slot.get_or_insert_with(|| vec![0.0; t.numel()]);
+    debug_assert_eq!(
+        g.len(),
+        src.len(),
+        "accumulate_grad: gradient length does not match the tensor"
+    );
+    // Accumulate in place; the previous version allocated a temporary the size
+    // of the gradient on every call and then moved it back over `g`.
     unsafe {
-        simd::add_f32_simd(g, src, &mut temp);
+        simd::add_assign_f32_simd(g, src);
     }
-    *g = temp;
 }
 
 #[inline]
 pub fn accumulate_grad_scaled(t: &Tensor, src: &[f32], scale: f32) {
-    let mut slot = t.grad.write().unwrap();
-    if slot.is_none() {
-        *slot = Some(vec![0.0; t.data().len()]);
-    }
-    let g = slot.as_mut().unwrap();
+    let mut slot = t.grad.write().expect("grad RwLock poisoned");
+    let g = slot.get_or_insert_with(|| vec![0.0; t.numel()]);
+    debug_assert_eq!(
+        g.len(),
+        src.len(),
+        "accumulate_grad_scaled: gradient length does not match the tensor"
+    );
 
     // Scale and accumulate
     for (gi, &s) in g.iter_mut().zip(src) {
         *gi += scale * s;
     }
+}
+
+/// Shared precondition for the element-wise operators: identical shapes.
+///
+/// Checking only the flat length let `[2,3] + [3,2]` through and silently
+/// produced a result labelled with the left operand's shape.
+#[inline]
+fn assert_same_shape(a: &Tensor, b: &Tensor, op: &str) {
+    assert_eq!(
+        a.shape(),
+        b.shape(),
+        "{op}: tensor shapes must match ({:?} vs {:?})",
+        a.shape(),
+        b.shape()
+    );
 }
 
 // Implement other trait combinations
@@ -377,11 +374,7 @@ impl Tensor {
 impl Sub for &Tensor {
     type Output = Tensor;
     fn sub(self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.data().len(),
-            other.data().len(),
-            "Tensor dimensions must match"
-        );
+        assert_same_shape(self, other, "sub");
 
         let self_data = self.data();
         let other_data = other.data();
@@ -440,11 +433,7 @@ impl Sub for Tensor {
 impl Div for &Tensor {
     type Output = Tensor;
     fn div(self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.data().len(),
-            other.data().len(),
-            "Tensor dimensions must match"
-        );
+        assert_same_shape(self, other, "div");
 
         let self_data = self.data();
         let other_data = other.data();
@@ -464,28 +453,28 @@ impl Div for &Tensor {
             let o = out.clone();
 
             Tape::push_binary_op(self, other, &out, move || {
-                if let Some(gout) = o.grad.read().unwrap().as_ref() {
+                if let Some(gout) = o.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    // d/da (a/b) = 1/b, d/db (a/b) = -a/b²
                     if a.requires_grad {
                         let bdat = b.data();
-                        let mut slot = a.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; bdat.len()]);
-                        }
-                        let ga = slot.as_mut().unwrap();
-                        for i in 0..ga.len() {
-                            ga[i] += gout[i] / bdat[i];
+                        let mut slot = a.grad.write().expect("grad RwLock poisoned");
+                        let ga = slot.get_or_insert_with(|| vec![0.0; a.numel()]);
+                        for ((g, &go), &bv) in ga.iter_mut().zip(gout.iter()).zip(bdat.iter()) {
+                            *g += go / bv;
                         }
                     }
                     if b.requires_grad {
                         let adat = a.data();
                         let bdat = b.data();
-                        let mut slot = b.grad.write().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(vec![0.0; adat.len()]);
-                        }
-                        let gb = slot.as_mut().unwrap();
-                        for i in 0..gb.len() {
-                            gb[i] -= gout[i] * adat[i] / (bdat[i] * bdat[i]);
+                        let mut slot = b.grad.write().expect("grad RwLock poisoned");
+                        let gb = slot.get_or_insert_with(|| vec![0.0; b.numel()]);
+                        for (((g, &go), &av), &bv) in gb
+                            .iter_mut()
+                            .zip(gout.iter())
+                            .zip(adat.iter())
+                            .zip(bdat.iter())
+                        {
+                            *g -= go * av / (bv * bv);
                         }
                     }
                 }

@@ -18,12 +18,6 @@ pub enum QuantizationType {
     NF4,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum QuantizationSchema {
-    Uniform,
-    PerChannel,
-}
-
 impl Default for QuantizationConfig {
     fn default() -> Self {
         Self {
@@ -101,29 +95,32 @@ impl QuantizationConfig {
         )
     }
 
-    // per-channel quantization (using Int8 as default)
-    pub fn per_channel(enabled: bool) -> Self {
-        Self {
-            enabled,
-            quant_type: QuantizationType::Int8, // Default to Int8 for per-channel
-        }
-    }
-
-    // scale factor for quantization = (max - min) / (qmax - qmin);
+    /// Scale factor for quantization: `(max - min) / (qmax - qmin)`.
+    ///
+    /// Returns `None` for float types, and for degenerate ranges that would
+    /// produce a zero or non-finite scale — every caller divides by this, so
+    /// handing back `0.0` turned every quantized value into an infinity.
     pub fn compute_scale(&self, min: f32, max: f32) -> Option<f32> {
-        if let Some((qmin, qmax)) = self.compute_range() {
-            Some((max - min) / (qmax - qmin) as f32)
-        } else {
-            None // Float types don't use scale/zero_point
-        }
+        let (qmin, qmax) = self.compute_range()?;
+        let scale = (max - min) / (qmax - qmin) as f32;
+        (scale.is_finite() && scale > 0.0).then_some(scale)
     }
 
-    // calculate zero-point scale: -min / scale
+    /// The integer code that represents 0.0, i.e. `qmin - min / scale`.
+    ///
+    /// Anchoring at `qmin` is what maps `min` onto the bottom of the grid. The
+    /// earlier `-min / scale` is only correct for an unsigned grid starting at
+    /// zero; on int8's `[-128, 127]` it shifted everything up by 128 and
+    /// clipped away half the representable range.
     pub fn compute_zero_point(&self, min: f32, scale: f32) -> Option<i32> {
-        if self.is_integer() {
-            Some((-min / scale).round() as i32)
-        } else {
-            None // Float types don't use zero_point
+        if !self.is_integer() || !scale.is_finite() || scale <= 0.0 {
+            return None; // Float types don't use zero_point
         }
+        let (qmin, qmax) = self.compute_range()?;
+        Some(
+            (qmin as f32 - min / scale)
+                .round()
+                .clamp(qmin as f32, qmax as f32) as i32,
+        )
     }
 }

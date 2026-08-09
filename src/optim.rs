@@ -3,32 +3,79 @@ use crate::Tensor;
 pub trait Optimizer {
     fn step(&mut self);
     fn zero_grad(&mut self);
+    fn get_lr(&self) -> f32;
+    fn set_lr(&mut self, lr: f32);
 }
 
+/// Stochastic gradient descent, optionally with classical momentum.
 pub struct SGD {
     params: Vec<Tensor>,
     lr: f32,
+    momentum: f32,
+    weight_decay: f32,
+    /// Velocity buffers, allocated lazily on the first step that sees a gradient.
+    velocity: Vec<Vec<f32>>,
 }
 
 impl SGD {
-    pub fn new(params: Vec<Tensor>, lr: f32, _momentum: Option<f32>) -> Self {
-        // TODO: Implement momentum
-        SGD { params, lr }
+    /// `momentum` of `None` or `Some(0.0)` gives vanilla SGD.
+    ///
+    /// The momentum argument used to be accepted and thrown away, so callers
+    /// asking for `Some(0.9)` silently got plain SGD.
+    pub fn new(params: Vec<Tensor>, lr: f32, momentum: Option<f32>) -> Self {
+        Self::with_weight_decay(params, lr, momentum, 0.0)
+    }
+
+    pub fn with_weight_decay(
+        params: Vec<Tensor>,
+        lr: f32,
+        momentum: Option<f32>,
+        weight_decay: f32,
+    ) -> Self {
+        let momentum = momentum.unwrap_or(0.0);
+        assert!(
+            (0.0..1.0).contains(&momentum),
+            "SGD momentum must be in [0, 1), got {momentum}"
+        );
+        let velocity = params.iter().map(|p| vec![0.0; p.numel()]).collect();
+
+        SGD {
+            params,
+            lr,
+            momentum,
+            weight_decay,
+            velocity,
+        }
     }
 }
 
 impl Optimizer for SGD {
     fn step(&mut self) {
-        for param in &self.params {
-            if let Some(grad) = param.grad() {
-                let mut param_data = param.data_mut();
-                let grad_data = grad.data();
+        for (i, param) in self.params.iter().enumerate() {
+            let velocity = &mut self.velocity[i];
+            let (lr, momentum, weight_decay) = (self.lr, self.momentum, self.weight_decay);
 
-                // Vanilla SGD update: param = param - lr * grad
-                for i in 0..param_data.len() {
-                    param_data[i] -= self.lr * grad_data[i];
+            param.with_grad(|grad| {
+                let mut data = param.data_mut();
+                assert_eq!(
+                    grad.len(),
+                    data.len(),
+                    "SGD: gradient length {} does not match parameter length {}",
+                    grad.len(),
+                    data.len()
+                );
+
+                for j in 0..data.len() {
+                    let g = grad[j] + weight_decay * data[j];
+                    if momentum > 0.0 {
+                        // v = μv + g ; p -= lr * v
+                        velocity[j] = momentum * velocity[j] + g;
+                        data[j] -= lr * velocity[j];
+                    } else {
+                        data[j] -= lr * g;
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -36,6 +83,14 @@ impl Optimizer for SGD {
         for param in &self.params {
             param.zero_grad();
         }
+    }
+
+    fn get_lr(&self) -> f32 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
     }
 }
 
@@ -88,27 +143,39 @@ impl Adam {
         let bias_correction1 = 1.0 - self.betas.0.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.betas.1.powi(self.t as i32);
         let step_size = self.lr * (bias_correction2.sqrt() / bias_correction1);
+        let (beta1, beta2) = self.betas;
+        let (eps, weight_decay) = (self.eps, self.weight_decay);
 
         for (i, param) in self.params.iter().enumerate() {
-            if let Some(grad) = param.grad_ref() {
+            let m_t = &mut self.m[i];
+            let v_t = &mut self.v[i];
+
+            // `with_grad` borrows the gradient under the read lock; `grad_ref`
+            // copied the whole vector once per parameter per step.
+            param.with_grad(|grad| {
                 let mut data = param.data_mut();
-                let m_t = &mut self.m[i];
-                let v_t = &mut self.v[i];
+                assert_eq!(
+                    grad.len(),
+                    data.len(),
+                    "Adam: gradient length {} does not match parameter length {}",
+                    grad.len(),
+                    data.len()
+                );
 
                 // Update biased first and second moment estimates
                 for j in 0..data.len() {
-                    let g = grad[j] + self.weight_decay * data[j]; // L2 regularization
+                    let g = grad[j] + weight_decay * data[j]; // L2 regularization
 
                     // m_t = β1 * m_{t-1} + (1 - β1) * g_t
-                    m_t[j] = self.betas.0 * m_t[j] + (1.0 - self.betas.0) * g;
+                    m_t[j] = beta1 * m_t[j] + (1.0 - beta1) * g;
 
                     // v_t = β2 * v_{t-1} + (1 - β2) * g_t^2
-                    v_t[j] = self.betas.1 * v_t[j] + (1.0 - self.betas.1) * g * g;
+                    v_t[j] = beta2 * v_t[j] + (1.0 - beta2) * g * g;
 
                     // Update parameters
-                    data[j] -= step_size * m_t[j] / (v_t[j].sqrt() + self.eps);
+                    data[j] -= step_size * m_t[j] / (v_t[j].sqrt() + eps);
                 }
-            }
+            });
         }
     }
 
@@ -124,6 +191,21 @@ impl Adam {
 
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(&mut self) {
+        Adam::step(self);
+    }
+    fn zero_grad(&mut self) {
+        Adam::zero_grad(self);
+    }
+    fn get_lr(&self) -> f32 {
+        Adam::get_lr(self)
+    }
+    fn set_lr(&mut self, lr: f32) {
+        Adam::set_lr(self, lr);
     }
 }
 
@@ -180,6 +262,21 @@ impl AdamW {
     }
 }
 
+impl Optimizer for AdamW {
+    fn step(&mut self) {
+        AdamW::step(self);
+    }
+    fn zero_grad(&mut self) {
+        AdamW::zero_grad(self);
+    }
+    fn get_lr(&self) -> f32 {
+        AdamW::get_lr(self)
+    }
+    fn set_lr(&mut self, lr: f32) {
+        AdamW::set_lr(self, lr);
+    }
+}
+
 /// Learning rate scheduler trait
 pub trait LRScheduler {
     fn step(&mut self, metrics: Option<f32>);
@@ -188,7 +285,6 @@ pub trait LRScheduler {
 
 /// Step learning rate scheduler - reduces LR by gamma every step_size epochs
 pub struct StepLR {
-    // base_lr: f32,
     current_lr: f32,
     step_size: usize,
     gamma: f32,
@@ -197,8 +293,8 @@ pub struct StepLR {
 
 impl StepLR {
     pub fn new(base_lr: f32, step_size: usize, gamma: f32) -> Self {
+        assert!(step_size > 0, "StepLR: step_size must be non-zero");
         StepLR {
-            // base_lr,
             current_lr: base_lr,
             step_size,
             gamma,
@@ -210,7 +306,7 @@ impl StepLR {
 impl LRScheduler for StepLR {
     fn step(&mut self, _metrics: Option<f32>) {
         self.current_epoch += 1;
-        if self.current_epoch % self.step_size == 0 {
+        if self.current_epoch.is_multiple_of(self.step_size) {
             self.current_lr *= self.gamma;
         }
     }
@@ -222,7 +318,6 @@ impl LRScheduler for StepLR {
 
 /// Exponential learning rate scheduler
 pub struct ExponentialLR {
-    // base_lr: f32,
     current_lr: f32,
     gamma: f32,
 }
@@ -230,7 +325,6 @@ pub struct ExponentialLR {
 impl ExponentialLR {
     pub fn new(base_lr: f32, gamma: f32) -> Self {
         ExponentialLR {
-            // base_lr,
             current_lr: base_lr,
             gamma,
         }
@@ -258,6 +352,7 @@ pub struct CosineAnnealingLR {
 
 impl CosineAnnealingLR {
     pub fn new(base_lr: f32, t_max: usize, min_lr: Option<f32>) -> Self {
+        assert!(t_max > 0, "CosineAnnealingLR: t_max must be non-zero");
         let min_lr = min_lr.unwrap_or(0.0);
         CosineAnnealingLR {
             base_lr,
@@ -273,7 +368,9 @@ impl LRScheduler for CosineAnnealingLR {
     fn step(&mut self, _metrics: Option<f32>) {
         self.current_epoch += 1;
 
-        let progress = (self.current_epoch as f32) / (self.t_max as f32);
+        // Clamp at t_max: past one half-period the raw cosine turns back up and
+        // the "annealed" rate would climb to base_lr again.
+        let progress = ((self.current_epoch as f32) / (self.t_max as f32)).min(1.0);
         let cos_val = (1.0 + (progress * std::f32::consts::PI).cos()) / 2.0;
 
         self.current_lr = self.min_lr + (self.base_lr - self.min_lr) * cos_val;
@@ -284,30 +381,46 @@ impl LRScheduler for CosineAnnealingLR {
     }
 }
 
+/// Whether a monitored metric improves by decreasing or increasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlateauMode {
+    /// Lower is better (loss).
+    #[default]
+    Min,
+    /// Higher is better (accuracy).
+    Max,
+}
+
 /// ReduceLROnPlateau - reduces learning rate when metric stops improving
 pub struct ReduceLROnPlateau {
     current_lr: f32,
     factor: f32,
     patience: usize,
     min_lr: f32,
-    mode: String, // "min" or "max"
+    mode: PlateauMode,
     best_metric: f32,
     patience_counter: usize,
+    /// Set when the last `step` actually reduced the rate, so callers can log it.
+    last_reduced: bool,
 }
 
 impl ReduceLROnPlateau {
+    /// `mode` defaults to [`PlateauMode::Min`].
+    ///
+    /// This used to take a `String` compared against `"min"`, so any typo
+    /// ("Min", "minimum") silently selected maximize-mode and drove the
+    /// learning rate down on every epoch.
     pub fn new(
         initial_lr: f32,
         factor: f32,
         patience: usize,
         min_lr: Option<f32>,
-        mode: Option<String>,
+        mode: Option<PlateauMode>,
     ) -> Self {
-        let mode = mode.unwrap_or_else(|| "min".to_string());
-        let best_metric = if mode == "min" {
-            f32::INFINITY
-        } else {
-            f32::NEG_INFINITY
+        let mode = mode.unwrap_or_default();
+        let best_metric = match mode {
+            PlateauMode::Min => f32::INFINITY,
+            PlateauMode::Max => f32::NEG_INFINITY,
         };
 
         ReduceLROnPlateau {
@@ -318,17 +431,23 @@ impl ReduceLROnPlateau {
             mode,
             best_metric,
             patience_counter: 0,
+            last_reduced: false,
         }
+    }
+
+    /// Whether the most recent [`LRScheduler::step`] reduced the learning rate.
+    pub fn just_reduced(&self) -> bool {
+        self.last_reduced
     }
 }
 
 impl LRScheduler for ReduceLROnPlateau {
     fn step(&mut self, metrics: Option<f32>) {
+        self.last_reduced = false;
         if let Some(metric) = metrics {
-            let improved = if self.mode == "min" {
-                metric < self.best_metric
-            } else {
-                metric > self.best_metric
+            let improved = match self.mode {
+                PlateauMode::Min => metric < self.best_metric,
+                PlateauMode::Max => metric > self.best_metric,
             };
 
             if improved {
@@ -340,7 +459,9 @@ impl LRScheduler for ReduceLROnPlateau {
                 if self.patience_counter >= self.patience {
                     self.current_lr = (self.current_lr * self.factor).max(self.min_lr);
                     self.patience_counter = 0;
-                    println!("Reducing learning rate to {:.6}", self.current_lr);
+                    // Reporting is the caller's decision; a library printing to
+                    // stdout mid-training corrupts progress bars and structured logs.
+                    self.last_reduced = true;
                 }
             }
         }
@@ -358,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_adam_optimizer() {
-        let _tape = Tape::reset();
+        Tape::reset();
 
         // Create some parameters
         let w = Tensor::randn(&[10, 10]).requires_grad();
@@ -412,12 +533,59 @@ mod tests {
         assert!(after_one < initial);
 
         // Test ReduceLROnPlateau
-        let mut plateau_lr = ReduceLROnPlateau::new(0.1, 0.5, 2, None, Some("min".to_string()));
+        let mut plateau_lr = ReduceLROnPlateau::new(0.1, 0.5, 2, None, Some(PlateauMode::Min));
 
         // Simulate no improvement
         plateau_lr.step(Some(1.0));
         plateau_lr.step(Some(1.0));
         plateau_lr.step(Some(1.0)); // Should trigger reduction
         assert!((plateau_lr.get_lr() - 0.05).abs() < 1e-6);
+        assert!(plateau_lr.just_reduced());
+    }
+
+    #[test]
+    fn cosine_annealing_does_not_climb_back_up_past_t_max() {
+        let mut cos_lr = CosineAnnealingLR::new(0.1, 5, Some(0.0));
+        for _ in 0..5 {
+            cos_lr.step(None);
+        }
+        let at_t_max = cos_lr.get_lr();
+        for _ in 0..5 {
+            cos_lr.step(None);
+        }
+        assert!(
+            (cos_lr.get_lr() - at_t_max).abs() < 1e-6,
+            "lr rose again after t_max: {} -> {}",
+            at_t_max,
+            cos_lr.get_lr()
+        );
+    }
+
+    #[test]
+    fn sgd_momentum_is_applied() {
+        // A constant gradient accelerates under momentum, so two momentum steps
+        // must move further than two plain-SGD steps.
+        let make = || {
+            let p = Tensor::new(vec![0.0; 4], &[4]).requires_grad();
+            *p.grad.write().unwrap() = Some(vec![1.0; 4]);
+            p
+        };
+
+        let plain_p = make();
+        let mut plain = SGD::new(vec![plain_p.clone()], 0.1, None);
+        let momentum_p = make();
+        let mut with_momentum = SGD::new(vec![momentum_p.clone()], 0.1, Some(0.9));
+
+        for _ in 0..2 {
+            plain.step();
+            with_momentum.step();
+        }
+
+        assert!(
+            momentum_p.data()[0] < plain_p.data()[0] - 1e-6,
+            "momentum had no effect: {} vs {}",
+            momentum_p.data()[0],
+            plain_p.data()[0]
+        );
     }
 }

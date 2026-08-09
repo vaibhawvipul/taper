@@ -11,6 +11,14 @@ pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
 
+    /// Switch this module (and any children) between training and inference
+    /// behaviour. Layers whose forward pass is mode-independent can ignore it.
+    ///
+    /// Without this, a `Dropout` inside a `Sequential` could never be turned
+    /// off — `forward` takes `&self`, so evaluation kept sampling masks and
+    /// reported noisy metrics.
+    fn set_training(&mut self, _training: bool) {}
+
     /// Quantize the model for inference
     fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
         panic!("Quantization not implemented for this module type")
@@ -32,9 +40,13 @@ pub struct Linear {
 
 impl Linear {
     pub fn new(in_features: usize, out_features: usize, with_bias: bool) -> Self {
-        // Xavier/He-style initialization
-        let scale = (2.0 / in_features as f32).sqrt();
-        let dist = Uniform::new_inclusive(-scale, scale);
+        assert!(in_features > 0, "Linear: in_features must be non-zero");
+        // He-uniform: U(-b, b) has variance b²/3, so b = sqrt(6/fan_in) is what
+        // gives the target variance 2/fan_in. Using sqrt(2/fan_in) as the bound
+        // (as this did) makes the initial variance 3x too small, which slows
+        // early training in deep stacks. Conv2d already derives its bound this way.
+        let bound = (6.0 / in_features as f32).sqrt();
+        let dist = Uniform::new_inclusive(-bound, bound);
 
         let mut rng = rand::thread_rng();
         let weight_data: Vec<f32> = (0..in_features * out_features)
@@ -150,6 +162,12 @@ impl Module for Sequential {
         self.layers.iter().fold(input.clone(), |x, l| l.forward(&x))
     }
 
+    fn set_training(&mut self, training: bool) {
+        for layer in &mut self.layers {
+            layer.set_training(training);
+        }
+    }
+
     fn quantize(&self, qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
         Box::new(QuantizedSequential {
             layers: self.layers.iter().map(|l| l.quantize(qconfig)).collect(),
@@ -187,6 +205,7 @@ pub struct Conv2d {
 }
 
 impl Conv2d {
+    #[allow(clippy::too_many_arguments)] // mirrors the standard conv2d signature
     pub fn new(
         in_channels: usize,
         out_channels: usize,
@@ -435,6 +454,7 @@ pub struct Conv2dReLU {
 }
 
 impl Conv2dReLU {
+    #[allow(clippy::too_many_arguments)] // mirrors the standard conv2d signature
     pub fn new(
         in_channels: usize,
         out_channels: usize,
@@ -675,14 +695,28 @@ impl Module for AdaptiveAvgPool2d {
             input.shape()[3],
         );
         let (h_out, w_out) = self.output_size;
+        assert!(
+            h_out > 0 && w_out > 0,
+            "AdaptiveAvgPool2d: output size must be non-zero, got {:?}",
+            self.output_size
+        );
+        // This lowers to a strided avg_pool, which can only hit the requested
+        // output exactly when the input divides evenly. Otherwise the pool
+        // silently produced a different shape than `output_size` advertised.
+        assert!(
+            h_in % h_out == 0 && w_in % w_out == 0,
+            "AdaptiveAvgPool2d: input {}x{} is not divisible by output {}x{}",
+            h_in,
+            w_in,
+            h_out,
+            w_out
+        );
 
         // Calculate kernel size and stride to achieve target output size
         let kernel_h = h_in / h_out;
         let kernel_w = w_in / w_out;
-        let stride_h = h_in / h_out;
-        let stride_w = w_in / w_out;
 
-        input.avg_pool2d((kernel_h, kernel_w), Some((stride_h, stride_w)), (0, 0))
+        input.avg_pool2d((kernel_h, kernel_w), Some((kernel_h, kernel_w)), (0, 0))
     }
 
     fn quantize(&self, _qconfig: &QuantizationConfig) -> Box<dyn QuantizedModule> {
@@ -710,14 +744,28 @@ impl QuantizedModule for QuantizedAdaptiveAvgPool2d {
             input.shape()[3],
         );
         let (h_out, w_out) = self.output_size;
+        assert!(
+            h_out > 0 && w_out > 0,
+            "AdaptiveAvgPool2d: output size must be non-zero, got {:?}",
+            self.output_size
+        );
+        // This lowers to a strided avg_pool, which can only hit the requested
+        // output exactly when the input divides evenly. Otherwise the pool
+        // silently produced a different shape than `output_size` advertised.
+        assert!(
+            h_in % h_out == 0 && w_in % w_out == 0,
+            "AdaptiveAvgPool2d: input {}x{} is not divisible by output {}x{}",
+            h_in,
+            w_in,
+            h_out,
+            w_out
+        );
 
         // Calculate kernel size and stride to achieve target output size
         let kernel_h = h_in / h_out;
         let kernel_w = w_in / w_out;
-        let stride_h = h_in / h_out;
-        let stride_w = w_in / w_out;
 
-        input.avg_pool2d((kernel_h, kernel_w), Some((stride_h, stride_w)), (0, 0))
+        input.avg_pool2d((kernel_h, kernel_w), Some((kernel_h, kernel_w)), (0, 0))
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -780,7 +828,7 @@ pub struct Dropout {
 impl Dropout {
     pub fn new(p: f32) -> Self {
         assert!(
-            p >= 0.0 && p <= 1.0,
+            (0.0..=1.0).contains(&p),
             "Dropout probability must be between 0 and 1"
         );
         Dropout { p, training: true }
@@ -792,6 +840,10 @@ impl Dropout {
 
     pub fn train(&mut self) {
         self.training = true;
+    }
+
+    pub fn is_training(&self) -> bool {
+        self.training
     }
 }
 
@@ -821,43 +873,50 @@ impl Module for Dropout {
         input * &mask
     }
 
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
     fn parameters(&self) -> Vec<Tensor> {
         vec![]
     }
 }
 
-/// Basic CNN block: Conv -> BatchNorm -> ReLU (BatchNorm will be added later)
-#[derive(Debug)]
-pub struct BasicBlock {
-    conv: Conv2d,
-    // batchnorm: BatchNorm2d, // TODO: Add when BatchNorm2d is implemented
-}
-
-impl BasicBlock {
-    pub fn new(in_channels: usize, out_channels: usize, stride: usize) -> Self {
-        BasicBlock {
-            conv: Conv2d::conv3x3(in_channels, out_channels, stride, 1),
-            // batchnorm: BatchNorm2d::new(out_channels),
-        }
-    }
-}
-
-impl Module for BasicBlock {
-    fn forward(&self, input: &Tensor) -> Tensor {
-        let out = self.conv.forward(input);
-        // let out = self.batchnorm.forward(&out); // TODO: Add when BatchNorm2d is implemented
-        out.relu()
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let params = self.conv.parameters();
-        // params.extend(self.batchnorm.parameters()); // TODO: Add when BatchNorm2d is implemented
-        params
-    }
-}
-
 // Helper implementations for tensor operations needed by grouped convolution
 impl Tensor {
+    /// Gather `indices` (flat positions into this tensor) into a new tensor of
+    /// `out_shape`, recording a scatter-add backward edge.
+    ///
+    /// All the slicing helpers below reduce to this. Previously they built
+    /// their outputs with a bare `Tensor::new`, which left grouped convolution
+    /// with no path back to its weights: `Conv2d` with `groups > 1` trained
+    /// forever without ever updating a parameter.
+    fn gather_flat(&self, indices: Vec<usize>, out_shape: &[usize]) -> Tensor {
+        let data = self.data();
+        let result_data: Vec<f32> = indices.iter().map(|&i| data[i]).collect();
+        drop(data);
+
+        let mut output = Tensor::new(result_data, out_shape);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+
+            crate::tape::Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    let mut slot = input.grad.write().expect("grad RwLock poisoned");
+                    let gin = slot.get_or_insert_with(|| vec![0.0; input.numel()]);
+                    for (&src_idx, &g) in indices.iter().zip(gout.iter()) {
+                        gin[src_idx] += g;
+                    }
+                }
+            });
+        }
+
+        output
+    }
+
     /// Extract a slice of channels from a 4D tensor
     pub fn slice_channels(&self, start: usize, end: usize) -> Tensor {
         assert_eq!(
@@ -867,22 +926,18 @@ impl Tensor {
         );
         assert!(start < end && end <= self.shape[1], "Invalid channel range");
 
-        let (n, _c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
         let c_slice = end - start;
 
-        let data = self.data();
-        let mut result_data = Vec::new();
-
+        let mut indices = Vec::with_capacity(n * c_slice * h * w);
         for batch in 0..n {
             for ch in start..end {
-                let base_idx = batch * self.shape[1] * h * w + ch * h * w;
-                for spatial in 0..(h * w) {
-                    result_data.push(data[base_idx + spatial]);
-                }
+                let base_idx = batch * c * h * w + ch * h * w;
+                indices.extend(base_idx..base_idx + h * w);
             }
         }
 
-        Tensor::new(result_data, &[n, c_slice, h, w])
+        self.gather_flat(indices, &[n, c_slice, h, w])
     }
 
     /// Extract output channels from weight tensor
@@ -899,18 +954,11 @@ impl Tensor {
 
         let (_c_out, c_in, k_h, k_w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
         let c_out_slice = end - start;
+        let per_filter = c_in * k_h * k_w;
 
-        let data = self.data();
-        let mut result_data = Vec::new();
+        let indices: Vec<usize> = (start * per_filter..end * per_filter).collect();
 
-        for out_ch in start..end {
-            let base_idx = out_ch * c_in * k_h * k_w;
-            for i in 0..(c_in * k_h * k_w) {
-                result_data.push(data[base_idx + i]);
-            }
-        }
-
-        Tensor::new(result_data, &[c_out_slice, c_in, k_h, k_w])
+        self.gather_flat(indices, &[c_out_slice, c_in, k_h, k_w])
     }
 
     /// Extract slice from 1D tensor (for bias)
@@ -918,10 +966,7 @@ impl Tensor {
         assert_eq!(self.shape.len(), 1, "slice_1d only works on 1D tensors");
         assert!(start < end && end <= self.shape[0], "Invalid range");
 
-        let data = self.data();
-        let result_data = data[start..end].to_vec();
-
-        Tensor::new(result_data, &[end - start])
+        self.gather_flat((start..end).collect(), &[end - start])
     }
 
     /// Concatenate tensors along specified dimension
@@ -955,63 +1000,61 @@ impl Tensor {
         let mut out_shape = first_shape.clone();
         out_shape[dim] = total_dim_size;
 
-        // Concatenate data
-        let mut result_data = Vec::new();
+        // The outer dimensions (before `dim`) are traversed in lockstep across
+        // the inputs; everything from `dim` onwards is contiguous per input.
+        // Expressing it this way handles every rank and axis, where the old
+        // hand-rolled cases covered only 2D and 4D-along-channels and bailed
+        // out with `unimplemented!` otherwise.
+        let outer: usize = first_shape[..dim].iter().product();
+        let inner: usize = first_shape[dim + 1..].iter().product();
 
-        // For efficiency, we'll implement this for common cases
-        match ndim {
-            2 => {
-                if dim == 0 {
-                    // Concatenate along rows
-                    for tensor in tensors {
-                        result_data.extend_from_slice(&tensor.data());
-                    }
-                } else {
-                    // Concatenate along columns
-                    let rows = first_shape[0];
-                    // let col_offset = 0;
+        let mut result_data = Vec::with_capacity(outer * total_dim_size * inner);
+        // Per input, which output positions its elements landed in — used to
+        // route gradients back without recomputing the layout.
+        let mut source_positions: Vec<Vec<usize>> = tensors
+            .iter()
+            .map(|t| Vec::with_capacity(t.numel()))
+            .collect();
 
-                    for row in 0..rows {
-                        for tensor in tensors {
-                            let cols = tensor.shape[1];
-                            let tensor_data = tensor.data();
-                            for col in 0..cols {
-                                result_data.push(tensor_data[row * cols + col]);
-                            }
-                        }
-                    }
+        for o in 0..outer {
+            for (ti, tensor) in tensors.iter().enumerate() {
+                let block = tensor.shape[dim] * inner;
+                let data = tensor.data();
+                let start = o * block;
+                for &v in &data[start..start + block] {
+                    source_positions[ti].push(result_data.len());
+                    result_data.push(v);
                 }
             }
-            4 => {
-                if dim == 1 {
-                    // Concatenate along channel dimension (most common for CNNs)
-                    let (n, _, h, w) = (
-                        first_shape[0],
-                        first_shape[1],
-                        first_shape[2],
-                        first_shape[3],
-                    );
-
-                    for batch in 0..n {
-                        for tensor in tensors {
-                            let c = tensor.shape[1];
-                            let tensor_data = tensor.data();
-                            for ch in 0..c {
-                                for spatial in 0..(h * w) {
-                                    let idx = batch * c * h * w + ch * h * w + spatial;
-                                    result_data.push(tensor_data[idx]);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // General case for other dimensions
-                    unimplemented!("General 4D concatenation not implemented for dim != 1");
-                }
-            }
-            _ => unimplemented!("Concatenation not implemented for {}D tensors", ndim),
         }
 
-        Tensor::new(result_data, &out_shape)
+        let mut output = Tensor::new(result_data, &out_shape);
+
+        // `cat` had no backward edge at all, so grouped convolution — its only
+        // caller — could never propagate gradients past the concatenation.
+        if let Some(anchor) = tensors.iter().find(|t| t.requires_grad) {
+            output.requires_grad = true;
+            let inputs: Vec<Tensor> = tensors.to_vec();
+            let out = output.clone();
+
+            // Anchor on a tensor that actually requires grad: `push_unary_op`
+            // drops the node otherwise, and the first input may not be the one.
+            crate::tape::Tape::push_unary_op(anchor, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    for (tensor, positions) in inputs.iter().zip(source_positions.iter()) {
+                        if !tensor.requires_grad {
+                            continue;
+                        }
+                        let mut slot = tensor.grad.write().expect("grad RwLock poisoned");
+                        let gin = slot.get_or_insert_with(|| vec![0.0; tensor.numel()]);
+                        for (local, &pos) in positions.iter().enumerate() {
+                            gin[local] += gout[pos];
+                        }
+                    }
+                }
+            });
+        }
+
+        output
     }
 }
