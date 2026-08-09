@@ -1682,6 +1682,7 @@ dependencies = [
  "lazy_static",
  "matrixmultiply",
  "mimalloc",
+ "openblas-src",
  "rand",
  "rand_distr",
  "rayon",

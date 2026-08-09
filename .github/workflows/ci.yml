@@ -54,9 +54,24 @@ jobs:
       - name: Doc tests
         run: cargo test --doc
 
+  # The `blas` feature swaps in a whole different gemm implementation, so it
+  # needs its own build. Both vendors are covered because the failure mode is
+  # in linkage, which differs per vendor, not in our code.
   blas:
-    name: openblas backend
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: blas (accelerate)
+            os: macos-latest
+            feature: blas-accelerate
+            setup: ""
+          - name: blas (openblas)
+            os: ubuntu-latest
+            feature: blas-openblas-system
+            setup: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
     env:
       RUSTFLAGS: "-D warnings"
     steps:
@@ -66,10 +81,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: openblas
-      - name: Install OpenBLAS
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev gfortran
+          key: ${{ matrix.name }}
+      - name: Install BLAS
+        if: matrix.setup != ''
+        run: ${{ matrix.setup }}
       - name: Clippy
-        run: cargo clippy --features blas-openblas --all-targets -- -D warnings
+        run: cargo clippy --features ${{ matrix.feature }} --all-targets -- -D warnings
       - name: Test
-        run: cargo test --features blas-openblas --all-targets
+        run: cargo test --features ${{ matrix.feature }} --all-targets

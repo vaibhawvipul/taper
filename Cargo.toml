@@ -16,6 +16,9 @@ indicatif = "0.17"
 matrixmultiply = "0.3"
 cblas-sys = { version = "0.1", optional = true }
 blas-src   = { version = "0.10", default-features = false, optional = true } # vendor chosen by features below
+# Only pulled in by `blas-openblas-system`, to flip openblas-src onto the
+# already-installed library instead of compiling OpenBLAS from source.
+openblas-src = { version = "0.10", default-features = false, features = ["system"], optional = true }
 rayon = { version = "1.10" }
 lazy_static = "1.4"
 
@@ -25,7 +28,11 @@ default = []
 
 # Enable BLAS via CBLAS API and select a vendor:
 blas = ["cblas-sys", "blas-src"]                # turn on CBLAS
-blas-openblas = ["blas", "blas-src/openblas"]   # build & link OpenBLAS
+blas-openblas = ["blas", "blas-src/openblas"]   # build OpenBLAS from source, then link it
+# Link an OpenBLAS already on the system (apt: libopenblas-dev). Building from
+# source needs a Fortran toolchain, takes minutes, and emits a shared object
+# that then has to be found via LD_LIBRARY_PATH.
+blas-openblas-system = ["blas-openblas", "dep:openblas-src"]
 blas-accelerate = ["blas", "blas-src/accelerate"] # macOS Accelerate
 
 [dev-dependencies]
