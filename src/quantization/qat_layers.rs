@@ -3,9 +3,25 @@
 //! This module provides QAT-aware wrappers for existing neural network layers,
 //! integrating fake quantization into the forward pass during training.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::qat_manager::global;
 use super::{FakeQuantize, QATConfig};
 use crate::{Tensor, nn::Module};
+
+/// Distinguishes auto-named layers from one another.
+///
+/// Module ids key global QAT state, and deriving them purely from layer
+/// dimensions (`linear_784`) meant any two same-shaped layers in a model —
+/// or in two concurrent tests — shared one entry and toggled each other.
+static NEXT_MODULE_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn auto_module_id(prefix: &str) -> String {
+    format!(
+        "{prefix}#{}",
+        NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// QAT-aware Linear layer that applies fake quantization during training
 #[derive(Debug)]
@@ -32,7 +48,8 @@ impl QATLinear {
         module_id: Option<String>,
     ) -> Self {
         let inner = crate::nn::Linear::new(in_features, out_features, with_bias);
-        let module_id = module_id.unwrap_or_else(|| format!("linear_{}", in_features));
+        let module_id = module_id
+            .unwrap_or_else(|| auto_module_id(&format!("linear_{in_features}_{out_features}")));
 
         let weight_fake_quant = if qat_config.is_enabled() {
             Some(FakeQuantize::new(
@@ -52,11 +69,16 @@ impl QATLinear {
             None
         };
 
+        let qat_enabled = qat_config.is_enabled();
+        // Register up front so the manager's status report and any later
+        // per-module override both see this layer.
+        global::set_module_qat(&module_id, qat_enabled);
+
         Self {
             inner,
             weight_fake_quant,
             activation_fake_quant,
-            qat_enabled: qat_config.is_enabled(),
+            qat_enabled,
             module_id,
         }
     }
@@ -67,9 +89,14 @@ impl QATLinear {
         global::set_module_qat(&self.module_id, enabled);
     }
 
-    /// Check if QAT is enabled for this layer
+    /// Check if QAT is configured for this layer.
+    ///
+    /// This reports the layer's own state. Whether fake quantization actually
+    /// runs additionally depends on the global master switch and training mode
+    /// — see the forward pass. Folding the master switch in here meant a freshly
+    /// built layer with an enabled config reported `false`.
     pub fn is_qat_enabled(&self) -> bool {
-        self.qat_enabled && global::is_module_qat_enabled(&self.module_id)
+        self.qat_enabled && global::is_module_enabled(&self.module_id)
     }
 
     /// Update quantization parameters for weights
@@ -90,8 +117,9 @@ impl QATLinear {
 
 impl Module for QATLinear {
     fn forward(&self, input: &Tensor) -> Tensor {
-        // Check if QAT is active
-        let qat_active = self.is_qat_enabled() && global::is_training();
+        // Fake quantization runs only when this layer, the global master
+        // switch, and training mode all agree.
+        let qat_active = self.is_qat_enabled() && global::is_qat_enabled() && global::is_training();
 
         if qat_active {
             // Apply fake quantization to weights
@@ -149,6 +177,7 @@ pub struct QATConv2d {
 
 impl QATConv2d {
     /// Create a new QAT-aware Conv2d layer
+    #[allow(clippy::too_many_arguments)] // mirrors the standard conv2d signature
     pub fn new(
         in_channels: usize,
         out_channels: usize,
@@ -171,8 +200,8 @@ impl QATConv2d {
             groups,
             bias,
         );
-        let module_id =
-            module_id.unwrap_or_else(|| format!("conv2d_{}_{}", in_channels, out_channels));
+        let module_id = module_id
+            .unwrap_or_else(|| auto_module_id(&format!("conv2d_{in_channels}_{out_channels}")));
 
         let weight_fake_quant = if qat_config.is_enabled() {
             Some(FakeQuantize::new(
@@ -192,11 +221,16 @@ impl QATConv2d {
             None
         };
 
+        let qat_enabled = qat_config.is_enabled();
+        // Register up front so the manager's status report and any later
+        // per-module override both see this layer.
+        global::set_module_qat(&module_id, qat_enabled);
+
         Self {
             inner,
             weight_fake_quant,
             activation_fake_quant,
-            qat_enabled: qat_config.is_enabled(),
+            qat_enabled,
             module_id,
         }
     }
@@ -207,9 +241,14 @@ impl QATConv2d {
         global::set_module_qat(&self.module_id, enabled);
     }
 
-    /// Check if QAT is enabled for this layer
+    /// Check if QAT is configured for this layer.
+    ///
+    /// This reports the layer's own state. Whether fake quantization actually
+    /// runs additionally depends on the global master switch and training mode
+    /// — see the forward pass. Folding the master switch in here meant a freshly
+    /// built layer with an enabled config reported `false`.
     pub fn is_qat_enabled(&self) -> bool {
-        self.qat_enabled && global::is_module_qat_enabled(&self.module_id)
+        self.qat_enabled && global::is_module_enabled(&self.module_id)
     }
 
     /// Update quantization parameters for weights
@@ -230,8 +269,9 @@ impl QATConv2d {
 
 impl Module for QATConv2d {
     fn forward(&self, input: &Tensor) -> Tensor {
-        // Check if QAT is active
-        let qat_active = self.is_qat_enabled() && global::is_training();
+        // Fake quantization runs only when this layer, the global master
+        // switch, and training mode all agree.
+        let qat_active = self.is_qat_enabled() && global::is_qat_enabled() && global::is_training();
 
         if qat_active {
             // Apply fake quantization to weights
@@ -297,9 +337,11 @@ impl QATSequential {
         module_id: Option<String>,
     ) -> Self {
         let inner = crate::nn::Sequential::new(layers);
-        let module_id = module_id.unwrap_or_else(|| "sequential".to_string());
+        let module_id = module_id.unwrap_or_else(|| auto_module_id("sequential"));
 
         let qat_enabled = qat_config.is_enabled();
+        global::set_module_qat(&module_id, qat_enabled);
+
         Self {
             inner,
             qat_config,
@@ -314,9 +356,14 @@ impl QATSequential {
         global::set_module_qat(&self.module_id, enabled);
     }
 
-    /// Check if QAT is enabled for this layer
+    /// Check if QAT is configured for this layer.
+    ///
+    /// This reports the layer's own state. Whether fake quantization actually
+    /// runs additionally depends on the global master switch and training mode
+    /// — see the forward pass. Folding the master switch in here meant a freshly
+    /// built layer with an enabled config reported `false`.
     pub fn is_qat_enabled(&self) -> bool {
-        self.qat_enabled && global::is_module_qat_enabled(&self.module_id)
+        self.qat_enabled && global::is_module_enabled(&self.module_id)
     }
 }
 
@@ -350,7 +397,7 @@ mod tests {
         let qat_linear = QATLinear::new(784, 128, true, &qat_config, None);
 
         assert!(qat_linear.is_qat_enabled());
-        assert_eq!(qat_linear.module_id, "linear_784");
+        assert!(qat_linear.module_id.starts_with("linear_784_128#"));
     }
 
     #[test]
@@ -384,7 +431,7 @@ mod tests {
         );
 
         assert!(qat_conv.is_qat_enabled());
-        assert_eq!(qat_conv.module_id, "conv2d_1_32");
+        assert!(qat_conv.module_id.starts_with("conv2d_1_32#"));
     }
 
     #[test]

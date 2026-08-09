@@ -390,7 +390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Benefits: 4x smaller model size, minimal accuracy loss.");
 
     let original_size = total_params * 4; // f32 = 4 bytes
-    let int8_size = total_params * 1; // int8 = 1 byte
+    let int8_size = total_params; // int8 = 1 byte
     let f16_size = total_params * 2; // float16 = 2 bytes
 
     println!("Model size comparison:");

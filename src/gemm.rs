@@ -1,4 +1,6 @@
-#![allow(dead_code)]
+//! Row-major SGEMM, backed by CBLAS when the `blas` feature is on and by
+//! `matrixmultiply` otherwise. Both arms mirror the CBLAS argument order.
+#![allow(clippy::too_many_arguments)]
 
 #[cfg(feature = "blas")]
 mod imp {

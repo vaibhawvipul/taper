@@ -55,18 +55,19 @@ impl QATManager {
         }
     }
 
-    /// Check if QAT is enabled for a specific module
-    pub fn is_module_qat_enabled(&self, module_id: &str) -> bool {
-        // Check global state first
-        if !self.is_qat_enabled() {
-            return false;
-        }
-
-        // Check module-specific state
+    /// Per-module QAT state, ignoring the global master switch.
+    ///
+    /// Modules default to enabled when nothing has been registered for them.
+    pub fn is_module_enabled(&self, module_id: &str) -> bool {
         self.module_states
             .read()
             .map(|states| states.get(module_id).copied().unwrap_or(true))
             .unwrap_or(true) // Default to enabled if not specified
+    }
+
+    /// Check if QAT is enabled for a specific module *and* globally.
+    pub fn is_module_qat_enabled(&self, module_id: &str) -> bool {
+        self.is_qat_enabled() && self.is_module_enabled(module_id)
     }
 
     /// Set training mode
@@ -104,7 +105,7 @@ impl QATManager {
     /// Enable QAT for all modules
     pub fn enable_all_modules(&self) {
         if let Ok(mut states) = self.module_states.write() {
-            for (_, enabled) in states.iter_mut() {
+            for enabled in states.values_mut() {
                 *enabled = true;
             }
         }
@@ -113,7 +114,7 @@ impl QATManager {
     /// Disable QAT for all modules
     pub fn disable_all_modules(&self) {
         if let Ok(mut states) = self.module_states.write() {
-            for (_, enabled) in states.iter_mut() {
+            for enabled in states.values_mut() {
                 *enabled = false;
             }
         }
@@ -195,6 +196,11 @@ pub mod global {
     /// Check if QAT is enabled for a specific module
     pub fn is_module_qat_enabled(module_id: &str) -> bool {
         get_global_qat_manager().is_module_qat_enabled(module_id)
+    }
+
+    /// Per-module QAT state, ignoring the global master switch.
+    pub fn is_module_enabled(module_id: &str) -> bool {
+        get_global_qat_manager().is_module_enabled(module_id)
     }
 
     /// Set training mode

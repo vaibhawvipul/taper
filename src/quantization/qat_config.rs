@@ -164,11 +164,11 @@ mod tests {
         let config = QATConfig::int8(0.001, 5);
 
         // During warmup, should be reduced
-        assert_eq!(config.get_effective_lr(0), 0.0001);
-        assert_eq!(config.get_effective_lr(4), 0.0001);
+        assert!((config.get_effective_lr(0) - 0.0001).abs() < 1e-9);
+        assert!((config.get_effective_lr(4) - 0.0001).abs() < 1e-9);
 
         // After warmup, should be full rate
-        assert_eq!(config.get_effective_lr(5), 0.001);
-        assert_eq!(config.get_effective_lr(10), 0.001);
+        assert!((config.get_effective_lr(5) - 0.001).abs() < 1e-9);
+        assert!((config.get_effective_lr(10) - 0.001).abs() < 1e-9);
     }
 }
