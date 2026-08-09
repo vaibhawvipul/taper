@@ -8,6 +8,7 @@ use blas_src as _;
 
 pub mod activation;
 pub mod data;
+pub mod error;
 pub mod gemm;
 pub mod gradcheck;
 pub mod loss;
@@ -21,6 +22,7 @@ pub mod tape;
 pub mod tensor;
 pub mod train;
 
+pub use error::ShapeError;
 pub use gemm::{n, sgemm_rowmajor, t};
 pub use quantization::{QATConfig, QATManager, QuantizationConfig, QuantizationType};
 pub use tape::Tape;

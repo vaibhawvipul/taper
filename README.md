@@ -1,6 +1,34 @@
 # taper
 A lightweight neural network library in Rust with automatic differentiation.
 
+## Verified gradients
+
+Every differentiable operation is checked against finite differences, because a
+hand-written backward that is quietly wrong does not announce itself — the loss
+still falls while other layers compensate. The check is public, so it applies to
+your own layers too:
+
+```rust
+use taper::gradcheck;
+
+gradcheck::check(&[input.clone()], |t| my_layer.forward(&t[0]))?;
+```
+
+## Error handling
+
+Shape preconditions that data can violate have a fallible form; the panicking
+form delegates to it, so the two cannot disagree:
+
+```rust
+match a.try_matmul(&b) {
+    Ok(product) => /* ... */,
+    Err(e) => eprintln!("bad shapes: {e}"),
+}
+```
+
+A panic elsewhere does not permanently disable a tensor — its locks recover
+rather than staying poisoned.
+
 ## Features
 - Dynamic computational graph with tape-based autograd
 - SIMD-optimized tensor operations (AVX/SSE/NEON, with a scalar fallback)

@@ -32,7 +32,7 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Tensor {
         let n = p.len();
 
         Tape::push_binary_op(predictions, targets, &out, move || {
-            if let Some(gout) = out_clone.grad.read().unwrap().as_ref() {
+            if let Some(gout) = crate::tensor::read_recovering(&out_clone.grad).as_ref() {
                 let g = gout[0]; // scalar chain multiplier from upstream
 
                 let pdat = preds.elements();
@@ -187,7 +187,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Tensor {
         drop(t);
 
         Tape::push_unary_op(logits, &out, move || {
-            if let Some(g) = out_c.grad.read().expect("grad RwLock poisoned").as_ref() {
+            if let Some(g) = crate::tensor::read_recovering(&out_c.grad).as_ref() {
                 // scale by upstream scalar / batch
                 let scale = g[0] / b as f32;
                 let grad: Vec<f32> = base_grad.iter().map(|v| v * scale).collect();
@@ -242,7 +242,7 @@ pub fn cross_entropy_loss_onehot(logits: &Tensor, targets: &Tensor) -> Tensor {
         Tape::push_unary_op(logits, &loss, move || {
             // A read lock is enough here; taking the write lock serialized
             // backward passes against every concurrent reader for no reason.
-            if let Some(gloss) = loss_out.grad.read().expect("grad RwLock poisoned").as_ref() {
+            if let Some(gloss) = crate::tensor::read_recovering(&loss_out.grad).as_ref() {
                 // Gradient: (softmax - targets) * grad_loss / batch_size
                 let scale = gloss[0] / batch_size as f32;
                 let grad_data: Vec<f32> = base_grad.iter().map(|g| g * scale).collect();
