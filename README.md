@@ -4,7 +4,7 @@ A lightweight neural network library in Rust with automatic differentiation.
 ## Features
 - Dynamic computational graph with tape-based autograd
 - SIMD-optimized tensor operations (AVX/SSE/NEON, with a scalar fallback)
-- Neural network layers: Linear, ReLU, Sigmoid, Conv2D, MaxPool2D, AvgPool2D, Dropout, Flatten
+- Neural network layers: Linear, Conv2D, MaxPool2D, AvgPool2D, LayerNorm, BatchNorm2d, Dropout, Flatten, ReLU, Sigmoid
 - Optimizers: SGD (with momentum), Adam, AdamW, and learning rate scheduling
 - Loss functions: MSE, Cross-entropy, BCE
 - Post-Training Quantization (PTQ) and Quantization-Aware Training (QAT)
@@ -75,6 +75,31 @@ Batching is a gather over indices rather than one sample at a time, so a whole
 batch can be assembled in a single pass.
 
 [`Dataset`]: https://docs.rs/taper/latest/taper/data/trait.Dataset.html
+
+### Normalization
+
+`LayerNorm` normalizes the trailing dimensions of each sample, so it is
+independent of batch composition. `BatchNorm2d` normalizes each channel across
+the batch, so it tracks running statistics during training and uses those at
+evaluation:
+
+```rust
+use taper::norm::{BatchNorm2d, LayerNorm};
+
+let model = Sequential::new(vec![
+    Box::new(Conv2dReLU::conv3x3(1, 32, 1, 1)),
+    Box::new(BatchNorm2d::new(32)),
+    // ...
+]);
+
+model.set_training(false); // BatchNorm switches to its running statistics
+```
+
+Running statistics are **buffers**, not parameters: they are saved and loaded
+with the model but never handed to an optimizer, which would apply momentum and
+weight decay to what are observations rather than weights. Normalizing with
+batch statistics at inference would make a prediction depend on whatever else
+shared its batch, and would divide by ~`eps` for a batch of one.
 
 ### Inference
 

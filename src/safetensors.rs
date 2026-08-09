@@ -386,49 +386,71 @@ pub fn load_ordered<P: AsRef<Path>>(path: P) -> Result<Vec<(String, Tensor)>, Er
     Ok(out)
 }
 
-/// Save a module's parameters, named by their position in `parameters()`.
+/// Save a module's parameters and buffers, named by their position.
 ///
-/// The trait exposes no names, so these are positional (`param.0`, `param.1`,
+/// The trait exposes no names, so these are positional (`param.0`, `buffer.0`,
 /// …) and only reload into a module with the same structure. Use [`save`]
 /// directly when you have real names to attach.
+///
+/// Buffers are included because a layer's non-learnable state is part of what
+/// makes it reproduce its results — a BatchNorm reloaded without its running
+/// statistics normalizes with reset ones and infers wrongly.
 pub fn save_module<P: AsRef<Path>>(module: &dyn Module, path: P) -> Result<(), Error> {
     let params = module.parameters();
-    let names: Vec<String> = (0..params.len()).map(|i| format!("param.{i}")).collect();
+    let buffers = module.buffers();
+
+    let names: Vec<String> = (0..params.len())
+        .map(|i| format!("param.{i}"))
+        .chain((0..buffers.len()).map(|i| format!("buffer.{i}")))
+        .collect();
     let entries: Vec<(&str, &Tensor)> = names
         .iter()
         .map(String::as_str)
-        .zip(params.iter())
+        .zip(params.iter().chain(buffers.iter()))
         .collect();
     save(&entries, path)
 }
 
-/// Load parameters written by [`save_module`] back into a module.
+/// Load parameters and buffers written by [`save_module`] back into a module.
 pub fn load_module<P: AsRef<Path>>(module: &dyn Module, path: P) -> Result<(), Error> {
     let loaded = load(path)?;
     let params = module.parameters();
+    let buffers = module.buffers();
 
-    if loaded.len() != params.len() {
+    let expected = params.len() + buffers.len();
+    if loaded.len() != expected {
         return Err(malformed(format!(
-            "file holds {} tensors but the module has {} parameters",
+            "file holds {} tensors but the module has {} parameters and {} buffers",
             loaded.len(),
-            params.len()
+            params.len(),
+            buffers.len()
         )));
     }
 
-    for (i, param) in params.iter().enumerate() {
-        let name = format!("param.{i}");
+    let targets = params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (format!("param.{i}"), t))
+        .chain(
+            buffers
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("buffer.{i}"), t)),
+        );
+
+    for (name, target) in targets {
         let source = loaded
             .get(&name)
             .ok_or_else(|| malformed(format!("file has no tensor named {name:?}")))?;
 
-        if source.shape() != param.shape() {
+        if source.shape() != target.shape() {
             return Err(malformed(format!(
                 "{name} has shape {:?} but the module expects {:?}",
                 source.shape(),
-                param.shape()
+                target.shape()
             )));
         }
-        param.data_mut().copy_from_slice(&source.to_vec());
+        target.data_mut().copy_from_slice(&source.to_vec());
     }
     Ok(())
 }
