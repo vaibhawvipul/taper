@@ -3,9 +3,12 @@
 use taper::tensor::broadcast_shape;
 use taper::{Tape, Tensor};
 
+/// `(lhs shape, rhs shape, expected broadcast shape or None)`
+type ShapeCase<'a> = (&'a [usize], &'a [usize], Option<&'a [usize]>);
+
 #[test]
 fn shape_rules_match_numpy() {
-    let cases: &[(&[usize], &[usize], Option<&[usize]>)] = &[
+    let cases: &[ShapeCase] = &[
         (&[3, 4], &[3, 4], Some(&[3, 4])),
         (&[3, 4], &[4], Some(&[3, 4])), // right-aligned, rank lifted
         (&[3, 1], &[1, 4], Some(&[3, 4])), // both stretch

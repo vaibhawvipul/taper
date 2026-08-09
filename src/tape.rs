@@ -1,5 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
+
+use smallvec::SmallVec;
 
 use crate::tensor::Tensor;
 
@@ -11,7 +14,7 @@ thread_local! {
     /// The tape never escapes its thread, so `Rc<RefCell<_>>` is the honest
     /// representation; the previous `Arc<RwLock<_>>` paid for atomic refcounts
     /// and lock arbitration that could never be contended.
-    static TAPE: RefCell<Vec<Rc<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
+    static TAPE: RefCell<Vec<Node>> = const { RefCell::new(Vec::new()) };
 
     /// Whether operations should record backward closures on the tape.
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
@@ -22,6 +25,15 @@ thread_local! {
 /// The tape is per-thread: a graph built on one thread can only be
 /// differentiated on that same thread.
 pub struct Tape;
+
+/// One recorded operation: how to propagate its gradient, and which earlier
+/// operations produced its inputs.
+struct Node {
+    backward_fn: Rc<dyn Fn()>,
+    /// Tape ids of the operands' producing operations. Inputs that are graph
+    /// leaves (parameters, constants) have no producer and are omitted.
+    parents: SmallVec<[usize; 2]>,
+}
 
 /// RAII guard that disables gradient recording for its lifetime.
 ///
@@ -79,7 +91,7 @@ impl Tape {
         if !(a.requires_grad || b.requires_grad) {
             return;
         }
-        Self::push(output, backward_fn);
+        Self::push(&[a, b], output, backward_fn);
     }
 
     pub fn push_unary_op<F>(input: &Tensor, output: &Tensor, backward_fn: F)
@@ -89,10 +101,10 @@ impl Tape {
         if !input.requires_grad {
             return;
         }
-        Self::push(output, backward_fn);
+        Self::push(&[input], output, backward_fn);
     }
 
-    fn push<F>(output: &Tensor, backward_fn: F)
+    fn push<F>(inputs: &[&Tensor], output: &Tensor, backward_fn: F)
     where
         F: Fn() + 'static,
     {
@@ -100,19 +112,30 @@ impl Tape {
             return;
         }
 
+        let parents: SmallVec<[usize; 2]> = inputs
+            .iter()
+            .map(|t| t.tape_node.load(Ordering::SeqCst))
+            .filter(|&id| id != NO_NODE)
+            .collect();
+
         let id = TAPE.with(|tape| {
             let mut nodes = tape.borrow_mut();
-            nodes.push(Rc::new(backward_fn));
+            nodes.push(Node {
+                backward_fn: Rc::new(backward_fn),
+                parents,
+            });
             nodes.len() - 1
         });
-        output
-            .tape_node
-            .store(id, std::sync::atomic::Ordering::SeqCst);
+        output.tape_node.store(id, Ordering::SeqCst);
     }
 }
 
-/// Execute backward functions up to `final_node_id` (inclusive), in reverse.
-/// We clone closures out first to avoid holding any borrows while executing.
+/// Propagate gradients backwards from the operation that produced a tensor.
+///
+/// Only operations `final_node_id` actually depends on are run. The tape used
+/// to replay *every* node up to that id, which did wasted work in the common
+/// case and was outright wrong with two independent graphs on one tape:
+/// differentiating one would also run the other's backward passes.
 pub fn backward(final_node_id: usize) {
     if final_node_id == NO_NODE {
         return;
@@ -126,11 +149,33 @@ pub fn backward(final_node_id: usize) {
             return Vec::new();
         }
         let end = final_node_id.min(nodes.len() - 1);
-        nodes[..=end].to_vec()
+
+        // Reachability over the parent edges.
+        let mut needed = vec![false; end + 1];
+        needed[end] = true;
+        let mut stack = vec![end];
+        while let Some(id) = stack.pop() {
+            for &parent in &nodes[id].parents {
+                if parent <= end && !needed[parent] {
+                    needed[parent] = true;
+                    stack.push(parent);
+                }
+            }
+        }
+
+        // Ids are handed out in creation order and every operand predates the
+        // operation consuming it, so descending id order is already a valid
+        // reverse-topological order — no sort required. Collected in execution
+        // order, so the caller must not reverse it again.
+        (0..=end)
+            .rev()
+            .filter(|&i| needed[i])
+            .map(|i| nodes[i].backward_fn.clone())
+            .collect()
     });
 
-    // Run in reverse with no outstanding borrows.
-    for f in fns.into_iter().rev() {
+    // Already in execution order; run with no outstanding borrows.
+    for f in fns {
         (f)();
     }
 }
