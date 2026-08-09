@@ -1687,6 +1687,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "reqwest",
+ "serde_json",
  "smallvec",
 ]
 

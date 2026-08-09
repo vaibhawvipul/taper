@@ -55,6 +55,33 @@ let predictions = model.forward(&inputs);
 
 `Tape::reset()` clears the recorded graph between training steps.
 
+## Saving and loading
+
+Models serialize to [safetensors](https://github.com/huggingface/safetensors),
+so weights interoperate with the wider ecosystem:
+
+```rust
+use taper::{Tensor, safetensors};
+
+safetensors::save(&[("weight", &w), ("bias", &b)], "model.safetensors")?;
+
+let loaded = safetensors::load("model.safetensors")?;
+assert_eq!(loaded["weight"].shape(), &[128, 784]);
+```
+
+Whole modules work too, with parameters named by position:
+
+```rust
+safetensors::save_module(&model, "model.safetensors")?;
+safetensors::load_module(&model, "model.safetensors")?;
+```
+
+`F32`, `BF16`, `F16`, `I32` and `U8` round-trip exactly. Wider dtypes found in
+other tools' checkpoints are narrowed on read — `F64` to `f32`, and
+`I64`/`U64`/`U32` to `i32`. Malformed files (overlapping tensors, gaps in the
+data buffer, a span that disagrees with its shape) are rejected rather than
+silently producing wrong weights.
+
 ## Quantization
 
 Storage quantization for model compression. Weights are stored quantized and

@@ -280,7 +280,23 @@ impl Trainer {
         self.metrics.plot_summary();
     }
 
-    /// Save model checkpoint.
+    /// Save the model's parameters as a safetensors file.
+    ///
+    /// Prefer this over [`Trainer::save_checkpoint`]: it is compact, exact, and
+    /// readable by any other safetensors implementation.
+    pub fn save_safetensors(&self, path: &str) -> Result<(), crate::safetensors::Error> {
+        crate::safetensors::save_module(self.model.as_ref(), path)
+    }
+
+    /// Load parameters from a safetensors file written by [`Trainer::save_safetensors`].
+    pub fn load_safetensors(&mut self, path: &str) -> Result<(), crate::safetensors::Error> {
+        crate::safetensors::load_module(self.model.as_ref(), path)
+    }
+
+    /// Save model checkpoint in a plain-text format.
+    ///
+    /// Kept for compatibility; [`Trainer::save_safetensors`] is smaller, exact,
+    /// and interoperable.
     ///
     /// Format: parameter count, then per parameter a shape line
     /// (`rank dim0 dim1 …`) followed by one value per line.
