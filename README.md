@@ -39,6 +39,43 @@ cargo run --release --features blas-accelerate --example train_mnist
 cargo run --release --features blas-accelerate --example train_mnist_cnn
 ```
 
+### Training on your own data
+
+Training works against the [`Dataset`] trait, not any particular dataset. For
+data already in memory, `TensorDataset` takes a stacked input tensor and a
+stacked target tensor — anything after the leading sample dimension is your
+feature shape, so `[N, features]` and `[N, C, H, W]` both work:
+
+```rust
+use taper::data::{DataLoader, TensorDataset};
+
+let dataset = TensorDataset::new(
+    Tensor::new(features, &[n_samples, n_features]),
+    Tensor::new(labels, &[n_samples]),
+);
+let mut loader = DataLoader::new(dataset, 32, true);
+
+trainer.fit(&mut loader, &mut val_loader, 10, true);
+```
+
+For data that does not fit in memory, or that needs decoding per batch,
+implement the trait directly:
+
+```rust
+impl Dataset for MyDataset {
+    fn len(&self) -> usize { self.rows.len() }
+
+    fn get_batch(&self, indices: &[usize]) -> (Tensor, Tensor) {
+        // gather these samples into (inputs, targets)
+    }
+}
+```
+
+Batching is a gather over indices rather than one sample at a time, so a whole
+batch can be assembled in a single pass.
+
+[`Dataset`]: https://docs.rs/taper/latest/taper/data/trait.Dataset.html
+
 ### Inference
 
 Forward passes record backward closures on a thread-local tape. Wrap inference

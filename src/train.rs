@@ -1,4 +1,4 @@
-use crate::data::mnist::DataLoader;
+use crate::data::{DataLoader, Dataset};
 use crate::loss::{correct_count, cross_entropy_loss};
 use crate::optim::{Adam, LRScheduler};
 use crate::{Tape, nn::Module};
@@ -99,7 +99,7 @@ impl Trainer {
     }
 
     /// Train for one epoch
-    pub fn train_epoch(&mut self, dataloader: &mut DataLoader) -> (f32, f32) {
+    pub fn train_epoch<D: Dataset>(&mut self, dataloader: &mut DataLoader<D>) -> (f32, f32) {
         let mut total_loss = 0.0;
         let mut total_correct = 0;
         let mut total_samples = 0;
@@ -148,7 +148,7 @@ impl Trainer {
     }
 
     /// Evaluate on validation/test set
-    pub fn evaluate(&self, dataloader: &mut DataLoader) -> (f32, f32) {
+    pub fn evaluate<D: Dataset>(&self, dataloader: &mut DataLoader<D>) -> (f32, f32) {
         let mut total_loss = 0.0;
         let mut total_correct = 0;
         let mut total_samples = 0;
@@ -184,10 +184,10 @@ impl Trainer {
     }
 
     /// Main training loop
-    pub fn fit(
+    pub fn fit<D: Dataset>(
         &mut self,
-        train_loader: &mut DataLoader,
-        val_loader: &mut DataLoader,
+        train_loader: &mut DataLoader<D>,
+        val_loader: &mut DataLoader<D>,
         epochs: usize,
         verbose: bool,
     ) {
@@ -403,10 +403,10 @@ impl Trainer {
 }
 
 /// Helper function to create and train a model quickly
-pub fn quick_train_mnist(
+pub fn quick_train_mnist<D: Dataset>(
     model: Box<dyn Module>,
-    train_loader: &mut DataLoader,
-    val_loader: &mut DataLoader,
+    train_loader: &mut DataLoader<D>,
+    val_loader: &mut DataLoader<D>,
     epochs: usize,
     learning_rate: f32,
 ) -> Metrics {
@@ -422,7 +422,11 @@ pub fn quick_train_mnist(
 }
 
 /// Utility function to test model on a few samples
-pub fn test_samples(model: &dyn Module, dataloader: &mut DataLoader, num_samples: usize) {
+pub fn test_samples<D: Dataset>(
+    model: &dyn Module,
+    dataloader: &mut DataLoader<D>,
+    num_samples: usize,
+) {
     println!("\nTesting on {} samples:", num_samples);
     println!("{}", "-".repeat(40));
 
