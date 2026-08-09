@@ -263,12 +263,154 @@ pub mod simd {
     }
 }
 
+/// The element type a tensor's storage holds.
+///
+/// Computation is always carried out in `f32`; a narrower dtype shrinks what a
+/// tensor *stores*, not the precision it is evaluated at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DType {
+    F32,
+    BF16,
+    F16,
+    I32,
+    U8,
+}
+
+impl DType {
+    /// Bytes per element.
+    pub fn size_of(&self) -> usize {
+        match self {
+            DType::F32 | DType::I32 => 4,
+            DType::BF16 | DType::F16 => 2,
+            DType::U8 => 1,
+        }
+    }
+}
+
+/// A tensor's backing buffer, in one of the supported element types.
+#[derive(Debug)]
+pub enum Storage {
+    F32(Vec<f32>),
+    BF16(Vec<u16>),
+    F16(Vec<u16>),
+    I32(Vec<i32>),
+    U8(Vec<u8>),
+}
+
+impl Storage {
+    pub fn dtype(&self) -> DType {
+        match self {
+            Storage::F32(_) => DType::F32,
+            Storage::BF16(_) => DType::BF16,
+            Storage::F16(_) => DType::F16,
+            Storage::I32(_) => DType::I32,
+            Storage::U8(_) => DType::U8,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Storage::F32(v) => v.len(),
+            Storage::BF16(v) | Storage::F16(v) => v.len(),
+            Storage::I32(v) => v.len(),
+            Storage::U8(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The element at `i`, widened to `f32`.
+    #[inline]
+    fn get_f32(&self, i: usize) -> f32 {
+        match self {
+            Storage::F32(v) => v[i],
+            Storage::BF16(v) => Tensor::bf16_to_f32(v[i]),
+            Storage::F16(v) => Tensor::f16_to_f32(v[i]),
+            Storage::I32(v) => v[i] as f32,
+            Storage::U8(v) => v[i] as f32,
+        }
+    }
+
+    /// The whole buffer widened to `f32`.
+    fn to_f32_vec(&self) -> Vec<f32> {
+        match self {
+            Storage::F32(v) => v.clone(),
+            Storage::BF16(v) => v.iter().map(|&x| Tensor::bf16_to_f32(x)).collect(),
+            Storage::F16(v) => v.iter().map(|&x| Tensor::f16_to_f32(x)).collect(),
+            Storage::I32(v) => v.iter().map(|&x| x as f32).collect(),
+            Storage::U8(v) => v.iter().map(|&x| x as f32).collect(),
+        }
+    }
+
+    /// The buffer as an `f32` slice. Only valid for `F32` storage.
+    #[inline]
+    pub(crate) fn as_f32_slice(&self) -> &[f32] {
+        match self {
+            Storage::F32(v) => v,
+            other => panic!("expected f32 storage, found {:?}", other.dtype()),
+        }
+    }
+
+    /// Narrow an `f32` buffer into this dtype.
+    fn from_f32(values: &[f32], dtype: DType) -> Storage {
+        match dtype {
+            DType::F32 => Storage::F32(values.to_vec()),
+            DType::BF16 => Storage::BF16(values.iter().map(|&x| Tensor::f32_to_bf16(x)).collect()),
+            DType::F16 => Storage::F16(values.iter().map(|&x| Tensor::f32_to_f16(x)).collect()),
+            DType::I32 => Storage::I32(values.iter().map(|&x| x as i32).collect()),
+            DType::U8 => Storage::U8(values.iter().map(|&x| x as u8).collect()),
+        }
+    }
+}
+
+/// Read guard over `f32` storage.
+///
+/// Derefs to `Vec<f32>` so the raw-slice call sites keep working unchanged.
+pub struct F32Ref<'a>(RwLockReadGuard<'a, Storage>);
+
+impl std::ops::Deref for F32Ref<'_> {
+    type Target = Vec<f32>;
+    #[inline]
+    fn deref(&self) -> &Vec<f32> {
+        match &*self.0 {
+            Storage::F32(v) => v,
+            other => panic!("expected f32 storage, found {:?}", other.dtype()),
+        }
+    }
+}
+
+/// Write guard over `f32` storage.
+pub struct F32Mut<'a>(RwLockWriteGuard<'a, Storage>);
+
+impl std::ops::Deref for F32Mut<'_> {
+    type Target = Vec<f32>;
+    #[inline]
+    fn deref(&self) -> &Vec<f32> {
+        match &*self.0 {
+            Storage::F32(v) => v,
+            other => panic!("expected f32 storage, found {:?}", other.dtype()),
+        }
+    }
+}
+
+impl std::ops::DerefMut for F32Mut<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Vec<f32> {
+        match &mut *self.0 {
+            Storage::F32(v) => v,
+            other => panic!("expected f32 storage, found {:?}", other.dtype()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Tensor {
     /// Flat backing buffer. Several tensors may share one storage: a view is a
     /// different (shape, stride, offset) window onto the same allocation.
     // Use RwLock for read-heavy workloads (most operations read data)
-    data: Arc<RwLock<Vec<f32>>>,
+    data: Arc<RwLock<Storage>>,
     pub(crate) shape: SmallVec<[usize; 4]>,
     /// Elements to skip in `data` per step along each dimension.
     pub(crate) stride: SmallVec<[usize; 4]>,
@@ -284,7 +426,7 @@ pub struct Tensor {
 /// Borrows the backing storage when the tensor is dense (the overwhelmingly
 /// common case, and free), and materializes only for a genuine view.
 pub enum Elements<'a> {
-    Borrowed(RwLockReadGuard<'a, Vec<f32>>),
+    Borrowed(F32Ref<'a>),
     Owned(Vec<f32>),
 }
 
@@ -650,7 +792,7 @@ impl Tensor {
             shape
         );
         Tensor {
-            data: Arc::new(RwLock::new(data)),
+            data: Arc::new(RwLock::new(Storage::F32(data))),
             stride: contiguous_strides(shape),
             offset: 0,
             shape: shape.iter().cloned().collect(),
@@ -670,6 +812,65 @@ impl Tensor {
         &self.stride
     }
 
+    /// The element type this tensor stores.
+    pub fn dtype(&self) -> DType {
+        self.data.read().expect("data RwLock poisoned").dtype()
+    }
+
+    /// Build a tensor directly over a typed buffer.
+    pub fn from_storage(storage: Storage, shape: &[usize]) -> Self {
+        let expected: usize = shape.iter().product();
+        assert_eq!(
+            storage.len(),
+            expected,
+            "from_storage: {} values do not fill shape {shape:?}",
+            storage.len()
+        );
+        Tensor {
+            data: Arc::new(RwLock::new(storage)),
+            stride: contiguous_strides(shape),
+            offset: 0,
+            shape: shape.iter().cloned().collect(),
+            grad: Arc::new(RwLock::new(None)),
+            requires_grad: false,
+            tape_node: Arc::new(std::sync::atomic::AtomicUsize::new(crate::tape::NO_NODE)),
+        }
+    }
+
+    /// Re-store this tensor's values in `dtype`.
+    ///
+    /// Narrowing loses precision, but the cast is element-wise with unit
+    /// derivative, so gradients pass straight through — the same
+    /// straight-through treatment mixed-precision training relies on.
+    pub fn to_dtype(&self, dtype: DType) -> Tensor {
+        if self.dtype() == dtype && self.is_contiguous() && self.offset == 0 {
+            return self.clone();
+        }
+
+        let widened = self.to_vec();
+        let mut output = Tensor::from_storage(Storage::from_f32(&widened, dtype), &self.shape);
+
+        if self.requires_grad {
+            output.requires_grad = true;
+            let input = self.clone();
+            let out = output.clone();
+
+            Tape::push_unary_op(self, &output, move || {
+                if let Some(gout) = out.grad.read().expect("grad RwLock poisoned").as_ref() {
+                    ops::accumulate_grad(&input, gout);
+                }
+            });
+        }
+
+        output
+    }
+
+    /// Bytes this tensor's storage occupies.
+    pub fn storage_bytes(&self) -> usize {
+        let storage = self.data.read().expect("data RwLock poisoned");
+        storage.len() * storage.dtype().size_of()
+    }
+
     /// Whether the logical elements are densely packed in row-major order.
     ///
     /// Note this is about *layout*: a contiguous tensor can still be a window
@@ -682,9 +883,11 @@ impl Tensor {
     /// Whether this tensor spans its entire backing buffer, so the raw slice
     /// from `data()` is exactly its logical elements in order.
     fn owns_whole_storage(&self) -> bool {
+        let storage = self.data.read().expect("data RwLock poisoned");
         self.offset == 0
             && self.is_contiguous()
-            && self.data.read().expect("data RwLock poisoned").len() == self.numel()
+            && storage.len() == self.numel()
+            && storage.dtype() == DType::F32
     }
 
     /// Build a view: a new tensor sharing this one's storage under a different
@@ -710,7 +913,7 @@ impl Tensor {
     /// The backing storage without the layout checks `data()` performs.
     /// Callers must account for `offset` and `stride` themselves.
     #[inline]
-    pub(crate) fn storage(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+    pub(crate) fn storage(&self) -> RwLockReadGuard<'_, Storage> {
         self.data.read().expect("data RwLock poisoned")
     }
 
@@ -740,7 +943,7 @@ impl Tensor {
     #[inline]
     pub fn elements(&self) -> Elements<'_> {
         if self.owns_whole_storage() {
-            Elements::Borrowed(self.data.read().expect("data RwLock poisoned"))
+            Elements::Borrowed(F32Ref(self.data.read().expect("data RwLock poisoned")))
         } else {
             Elements::Owned(self.to_vec())
         }
@@ -899,8 +1102,9 @@ impl Tensor {
     /// caller accumulates gradients into the *original* tensor directly.
     pub(crate) fn packed_operand(&self) -> Tensor {
         match self.gemm_layout_2d() {
-            Some(_) => self.clone(),
-            None => Tensor::new(self.to_vec(), &self.shape),
+            // GEMM reads the buffer directly, so a narrow dtype must widen first.
+            Some(_) if self.dtype() == DType::F32 => self.clone(),
+            _ => Tensor::new(self.to_vec(), &self.shape),
         }
     }
 
@@ -911,7 +1115,7 @@ impl Tensor {
     pub fn to_vec(&self) -> Vec<f32> {
         let storage = self.data.read().expect("data RwLock poisoned");
         if self.offset == 0 && self.is_contiguous() && storage.len() == self.numel() {
-            return storage.clone();
+            return storage.to_f32_vec();
         }
 
         let n = self.numel();
@@ -922,7 +1126,7 @@ impl Tensor {
 
         // Odometer walk: advance the fastest-varying dimension, carrying over.
         for _ in 0..n {
-            out.push(storage[cursor]);
+            out.push(storage.get_f32(cursor));
             for d in (0..ndim).rev() {
                 index[d] += 1;
                 cursor += self.stride[d];
@@ -976,41 +1180,48 @@ impl Tensor {
         &self.shape
     }
 
-    /// The raw backing slice, valid to index linearly.
-    ///
-    /// # Panics
-    /// If this tensor is a view — a strided or offset window onto a larger
-    /// storage — where linear indexing would silently read the wrong elements.
-    /// Call [`Tensor::to_vec`] for the logical contents of any layout, or
-    /// [`Tensor::contiguous`] to materialize first.
-    ///
-    /// This is a hard assert rather than a `debug_assert` on purpose: reading a
-    /// view as if it were dense produces plausible wrong numbers, which is the
-    /// failure mode this library can least afford.
+    /// Panic with the specific reason `data()`/`data_mut()` cannot hand out a
+    /// raw f32 slice: wrong dtype, or a strided/offset window.
     #[inline]
-    pub fn data(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+    fn assert_dense_f32(&self, accessor: &str) {
+        let dtype = self.dtype();
+        assert!(
+            dtype == DType::F32,
+            "{accessor} needs f32 storage, but this tensor holds {dtype:?}; \
+             use to_vec(), elements(), or to_dtype(DType::F32)"
+        );
         assert!(
             self.owns_whole_storage(),
-            "data() on a non-contiguous view (shape {:?}, stride {:?}, offset {}); \
+            "{accessor} on a non-contiguous view (shape {:?}, stride {:?}, offset {}); \
              use to_vec() or contiguous()",
             self.shape,
             self.stride,
             self.offset
         );
-        self.data.read().expect("data RwLock poisoned")
+    }
+
+    /// The raw backing slice, valid to index linearly.
+    ///
+    /// # Panics
+    /// If this tensor does not hold `f32`, or is a view — a strided or offset
+    /// window onto a larger storage — where linear indexing would silently read
+    /// the wrong elements. Call [`Tensor::to_vec`] or [`Tensor::elements`] for
+    /// the logical contents of any layout and dtype.
+    ///
+    /// These are hard asserts rather than `debug_assert`s on purpose: reading a
+    /// view as if it were dense produces plausible wrong numbers, which is the
+    /// failure mode this library can least afford.
+    #[inline]
+    pub fn data(&self) -> F32Ref<'_> {
+        self.assert_dense_f32("data()");
+        F32Ref(self.data.read().expect("data RwLock poisoned"))
     }
 
     /// Mutable access to the raw backing slice. Same restriction as [`Tensor::data`].
     #[inline]
-    pub fn data_mut(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
-        assert!(
-            self.owns_whole_storage(),
-            "data_mut() on a non-contiguous view (shape {:?}, stride {:?}, offset {})",
-            self.shape,
-            self.stride,
-            self.offset
-        );
-        self.data.write().expect("data RwLock poisoned")
+    pub fn data_mut(&self) -> F32Mut<'_> {
+        self.assert_dense_f32("data_mut()");
+        F32Mut(self.data.write().expect("data RwLock poisoned"))
     }
 
     /// Read-only view of grad vector if it exists.
